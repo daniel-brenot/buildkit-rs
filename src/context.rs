@@ -148,11 +148,7 @@ pub fn copy_into(context: &BuildContext, src: &Path, dest: &Path) -> Result<(), 
             fs::create_dir_all(parent)?;
         }
         fs::copy(src, dest).map_err(|e| {
-            Error::other(format!(
-                "copy {} -> {}: {e}",
-                src.display(),
-                dest.display()
-            ))
+            Error::other(format!("copy {} -> {}: {e}", src.display(), dest.display()))
         })?;
         return Ok(());
     }

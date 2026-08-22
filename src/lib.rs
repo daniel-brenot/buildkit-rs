@@ -1,23 +1,20 @@
-//! Build OCI images from Dockerfiles with a pluggable execution backend.
+//! Build OCI images from Dockerfiles with a pluggable execution backend
+//! and image store.
 //!
 //! [`Buildkit`] pulls base images, applies Dockerfile instructions, and writes
-//! the result to a local [`ImageStore`]. Everything except `RUN` is handled
-//! here: unpacking layers, `COPY` / `ADD`, metadata, layer cache, and export.
-//! `RUN` is delegated to a [`Backend`] you provide so any runtime can execute
-//! build steps. Instruction cache storage is delegated to a [`CacheHandler`];
-//! the default is OS-specific ([`LinuxCacheHandler`], [`MacosCacheHandler`],
-//! or [`WindowsCacheHandler`]).
+//! the result through an [`ImageStore`]. Everything except `RUN` and blob I/O
+//! is handled here: unpacking layers, `COPY` / `ADD`, metadata, overlay2 layer
+//! cache, and export. `RUN` is delegated to a [`Backend`] you provide so any
+//! runtime can execute build steps. Image configs and layer blobs go through
+//! [`ImageStore`]; the default is [`LocalImageStore`] (Docker data-root layout).
 //!
 //! # Quick start
 //!
 //! ```no_run
-//! use buildkit::{BuildRequest, Buildkit, ImageStore, NoopBackend};
+//! use buildkit::{BuildRequest, Buildkit, NoopBackend};
 //!
 //! # async fn example() -> Result<(), buildkit::Error> {
-//! let kit = Buildkit::new(
-//!     NoopBackend,
-//!     ImageStore::new("/var/lib/buildkit".into()),
-//! )?;
+//! let kit = Buildkit::new(NoopBackend)?;
 //! let result = kit
 //!     .build(BuildRequest::new(".").tag("myapp:latest"))
 //!     .await?;
@@ -53,13 +50,16 @@
 //!
 //! A non-zero [`RunResult::status`] fails the build.
 //!
-//! # Cache handler
+//! # Image store
 //!
-//! Instruction snapshots are stored through [`CacheHandler`]. [`Buildkit::new`]
-//! installs [`default_cache_handler`], which is [`MacosCacheHandler`] on macOS,
-//! [`WindowsCacheHandler`] on Windows, and [`LinuxCacheHandler`] elsewhere.
-//! Those currently use directory snapshots; replace them with
-//! [`LayerCache::with_handler`] or [`Buildkit::with_cache_handler`].
+//! Pulled and exported blobs are stored through [`ImageStore`]. [`Buildkit::new`]
+//! uses [`LocalImageStore::default`] (Docker's data-root on this platform).
+//! Pass another directory with [`LocalImageStore::new`], or implement
+//! [`ImageStore`] and construct with [`Buildkit::with_image_store`].
+//!
+//! Overlay2 instruction snapshots still live under [`ImageStore::root`] — that
+//! path must be a writable host directory because `RUN` / `COPY` need real
+//! files. Only configs and layer blobs go through the trait.
 //!
 //! # Pulling without a Dockerfile
 //!
@@ -121,12 +121,7 @@ pub use backend::NoopBackend;
 pub use backend::RunRequest;
 pub use backend::RunResult;
 pub use buildkit::Buildkit;
-pub use cache::default_cache_handler;
-pub use cache::CacheHandler;
 pub use cache::LayerCache;
-pub use cache::LinuxCacheHandler;
-pub use cache::MacosCacheHandler;
-pub use cache::WindowsCacheHandler;
 pub use error::Error;
 pub use export::ImageMeta;
 pub use materialize::materialize_rootfs;
@@ -148,6 +143,9 @@ pub use reference::parse_reference;
 pub use request::BuildRequest;
 pub use request::BuildResult;
 pub use store::ImageStore;
+pub use store::LocalImageStore;
+pub use store::StoredImage;
+pub use store::StoredLayer;
 
 #[doc(inline)]
 pub use dockerfile::{Dockerfile, Instruction, Stage};
@@ -160,8 +158,8 @@ use crate::progress::PullEvent as ProgressEvent;
 ///
 /// Does not unpack layers. Pass `force_pull` to consult the registry even when
 /// a local copy exists. See [`ensure_rootfs`] to also materialize a rootfs.
-pub async fn ensure_image(
-    store: &ImageStore,
+pub async fn ensure_image<S: ImageStore>(
+    store: &S,
     image: &str,
     platform: &Platform,
     force_pull: bool,
@@ -170,8 +168,8 @@ pub async fn ensure_image(
 }
 
 /// [`ensure_image`] that reports download progress to `progress`.
-pub async fn ensure_image_with_progress(
-    store: &ImageStore,
+pub async fn ensure_image_with_progress<S: ImageStore>(
+    store: &S,
     image: &str,
     platform: &Platform,
     force_pull: bool,
@@ -189,8 +187,8 @@ pub async fn ensure_image_with_progress(
 ///
 /// Reuses a previous unpack of the same content when the fingerprint still
 /// matches. `force_pull` always re-fetches from the registry first.
-pub async fn ensure_rootfs(
-    store: &ImageStore,
+pub async fn ensure_rootfs<S: ImageStore>(
+    store: &S,
     image: &str,
     dest: &std::path::Path,
     platform: &Platform,
@@ -212,8 +210,8 @@ pub async fn ensure_rootfs(
 ///
 /// When `announce_missing` is true and the image is not cached, emits
 /// [`PullEvent::UnableToFindLocally`] before pulling.
-pub async fn ensure_rootfs_with_progress(
-    store: &ImageStore,
+pub async fn ensure_rootfs_with_progress<S: ImageStore>(
+    store: &S,
     image: &str,
     dest: &std::path::Path,
     platform: &Platform,

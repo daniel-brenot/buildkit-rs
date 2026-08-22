@@ -1,18 +1,15 @@
-//! Docker-style local layer cache.
+//! Docker overlay2 local layer cache.
 //!
 //! Each instruction produces a chain id:
 //! `sha256(parent_id || "\\n" || instruction_key)`.
-//! Storage is delegated to a [`CacheHandler`]. The default handler is
-//! OS-specific and currently keeps snapshots under `<store>/cache/<id>/`.
-//!
-//! Cache hits return a path into the snapshot (no copy). Callers must
-//! copy-on-write before mutating the rootfs. Packed `layer.tar.gz` blobs are
-//! stored after the first export so fully-cached rebuilds skip retarring.
+//! Snapshots use Docker's overlay2 graph-driver layout. Cache hits return a
+//! path into the snapshot (no copy). Callers must copy-on-write before
+//! mutating the rootfs. Packed `layer.tar.gz` blobs are stored after the first
+//! export so fully-cached rebuilds skip retarring.
 
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use dockerfile::Instruction;
 use sha2::{Digest, Sha256};
@@ -26,105 +23,77 @@ use crate::reference::parse_reference;
 use crate::store::ImageStore;
 use crate::Error;
 
-mod fs;
-mod handler;
-mod linux;
-mod macos;
-mod windows;
+mod overlay2;
 
-pub use handler::default_cache_handler;
-pub use handler::CacheHandler;
-pub use linux::LinuxCacheHandler;
-pub use macos::MacosCacheHandler;
-pub use windows::WindowsCacheHandler;
+use overlay2::Overlay2;
 
-/// Docker-style local layer cache for instruction snapshots.
+/// Docker overlay2 instruction-layer cache.
 ///
-/// Delegates reads and writes to a [`CacheHandler`]. [`Self::open`] installs
-/// the OS default ([`LinuxCacheHandler`], [`MacosCacheHandler`], or
-/// [`WindowsCacheHandler`]). Override with [`Self::with_handler`].
-#[derive(Clone)]
+/// Opened under `<data_root>/overlay2`. Not a swap point — image blobs go
+/// through [`ImageStore`]; this type only holds instruction snapshots.
+#[derive(Debug, Clone)]
 pub struct LayerCache {
-    handler: Arc<dyn CacheHandler>,
-}
-
-impl std::fmt::Debug for LayerCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LayerCache")
-            .field("handler", &self.handler)
-            .finish()
-    }
+    overlay: Overlay2,
 }
 
 impl LayerCache {
-    /// Open the OS-default cache under `<data_root>/cache`.
+    /// Open the overlay2 cache under `data_root`.
     pub fn open(data_root: &Path) -> Result<Self, Error> {
         Ok(Self {
-            handler: Arc::from(default_cache_handler(data_root)?),
+            overlay: Overlay2::open(data_root)?,
         })
-    }
-
-    /// Use a custom [`CacheHandler`] for all cache reads and writes.
-    pub fn with_handler(handler: impl CacheHandler + 'static) -> Self {
-        Self {
-            handler: Arc::new(handler),
-        }
-    }
-
-    /// The active storage handler.
-    pub fn handler(&self) -> &dyn CacheHandler {
-        &*self.handler
     }
 
     /// Directory that holds per-id snapshot folders.
     pub fn root(&self) -> &Path {
-        self.handler.root()
+        self.overlay.overlay_root()
     }
 
     /// Whether a complete cache entry exists for chain id `id`.
     pub fn has(&self, id: &str) -> bool {
-        self.handler.has(id)
+        self.overlay.has_id(id)
     }
 
     /// Load image config and build-arg state for chain id `id` (no filesystem copy).
     pub fn load_meta(&self, id: &str) -> Result<(ImageMeta, HashMap<String, String>), Error> {
-        self.handler.load_meta(id)
+        self.overlay.load_meta_id(id)
     }
 
     /// Path to the materialized rootfs for `id`.
     pub fn resolve_rootfs(&self, id: &str) -> Result<PathBuf, Error> {
-        self.handler.resolve_rootfs(id)
+        self.overlay.resolve_id(id)
     }
 
-    /// Path to a packed layer blob if the handler stores it as a file.
+    /// Path to a packed layer blob if stored as a file.
     pub fn layer_blob_path(&self, id: &str) -> Option<PathBuf> {
-        self.handler.layer_blob_path(id)
+        Some(self.overlay.blob_path(id))
     }
 
     /// Whether a packed layer blob exists for this chain id.
     pub fn has_layer_blob(&self, id: &str) -> bool {
-        self.handler.has_layer_blob(id)
+        self.overlay.has_layer_blob(id)
     }
 
     /// Read the packed export blob for `id`.
     pub fn read_layer_blob(&self, id: &str) -> Result<Vec<u8>, Error> {
-        self.handler.read_layer_blob(id)
+        self.overlay.read_layer_blob(id)
     }
 
     /// Digest label stored for the packed blob (`sha256:…`).
     pub fn layer_blob_digest(&self, id: &str) -> Result<String, Error> {
-        self.handler.layer_blob_digest(id)
+        self.overlay.layer_blob_digest(id)
     }
 
     /// Store a packed export blob for `id`.
     pub fn write_layer_blob(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
-        self.handler.write_layer_blob(id, bytes)
+        self.overlay.write_layer_blob(id, bytes)
     }
 
     /// Persist the current stage state under chain id `id`.
     ///
-    /// When `filesystem_changed` is false, the rootfs is reused from `parent`
-    /// (copy-on-write). When true, `rootfs` is copied into the new entry.
+    /// When `filesystem_changed` is false, the new layer has an empty `diff/`
+    /// and reuses the parent's lower chain. When true, `rootfs` is stored as an
+    /// overlay2 changeset against the parent.
     pub fn save(
         &self,
         id: &str,
@@ -135,13 +104,20 @@ impl LayerCache {
         rootfs: &Path,
         filesystem_changed: bool,
     ) -> Result<(), Error> {
-        self.handler
-            .save(id, parent, instruction, meta, args, rootfs, filesystem_changed)
+        self.overlay.save_layer(
+            id,
+            parent,
+            instruction,
+            meta,
+            args,
+            rootfs,
+            filesystem_changed,
+        )
     }
 
     /// Remove all cached layers.
     pub fn clear(&self) -> Result<(), Error> {
-        self.handler.clear()
+        self.overlay.clear_all()
     }
 }
 
@@ -155,8 +131,8 @@ pub fn chain_id(parent: &str, instruction_key: &str) -> String {
 }
 
 /// Instruction-key prefix for a `FROM` line (includes base digest when known).
-pub fn from_cache_key(
-    store: &ImageStore,
+pub fn from_cache_key<S: ImageStore>(
+    store: &S,
     base: &str,
     scratch: bool,
     platform: &Platform,
@@ -171,15 +147,11 @@ pub fn from_cache_key(
     )
 }
 
-fn parse_reference_digest(store: &ImageStore, base: &str, platform: &Platform) -> String {
+fn parse_reference_digest<S: ImageStore>(store: &S, base: &str, platform: &Platform) -> String {
     match parse_reference(base) {
-        Ok(reference) => {
-            let dir = store.image_dir(&reference, platform);
-            std::fs::read_to_string(dir.join("digest"))
-                .unwrap_or_else(|_| "unknown".into())
-                .trim()
-                .to_string()
-        }
+        Ok(reference) => store
+            .image_digest(&reference, platform)
+            .unwrap_or_else(|| "unknown".into()),
         Err(_) => "unknown".into(),
     }
 }
@@ -317,11 +289,7 @@ pub fn instruction_cache_key(
             Ok((format!("EXPOSE|{}", ports.join(" ")), false))
         }
         Instruction::Volume(vol) => {
-            let vols: Vec<_> = vol
-                .paths
-                .iter()
-                .map(|v| expand::expand(v, &vars))
-                .collect();
+            let vols: Vec<_> = vol.paths.iter().map(|v| expand::expand(v, &vars)).collect();
             Ok((format!("VOLUME|{}", vols.join(" ")), false))
         }
         Instruction::Shell(sh) => Ok((format!("SHELL|{:?}", sh.args), false)),
@@ -409,7 +377,7 @@ mod tests {
     use crate::export::ImageMeta;
 
     #[test]
-    fn default_handler_save_and_has() {
+    fn overlay2_save_and_has() {
         let root = std::env::temp_dir().join(format!(
             "buildkit-cache-handler-{}-{}",
             std::process::id(),
@@ -437,7 +405,33 @@ mod tests {
             )
             .unwrap();
         assert!(cache.has("abc"));
-        assert!(cache.resolve_rootfs("abc").unwrap().join("hello.txt").is_file());
+        assert!(cache
+            .resolve_rootfs("abc")
+            .unwrap()
+            .join("hello.txt")
+            .is_file());
+
+        let child_root = root.join("stage-child");
+        std::fs::create_dir_all(&child_root).unwrap();
+        std::fs::write(child_root.join("hello.txt"), b"hi").unwrap();
+        std::fs::write(child_root.join("extra.txt"), b"x").unwrap();
+        cache
+            .save(
+                "def",
+                "abc",
+                "COPY extra.txt /",
+                &ImageMeta::new(),
+                &HashMap::new(),
+                &child_root,
+                true,
+            )
+            .unwrap();
+        let merged = cache.resolve_rootfs("def").unwrap();
+        assert!(merged.join("hello.txt").is_file());
+        assert!(merged.join("extra.txt").is_file());
+        let child_diff = root.join("overlay2").join("def").join("diff");
+        assert!(child_diff.join("extra.txt").is_file());
+        assert!(!child_diff.join("hello.txt").exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

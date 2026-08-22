@@ -5,10 +5,10 @@ use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::winpath;
 use flate2::read::GzDecoder;
 use tar::Archive;
 use tar::EntryType;
-use crate::winpath;
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 const WHITEOUT_OPAQUE: &str = ".wh..wh..opq";
@@ -31,8 +31,7 @@ fn setxattr_u32(path: &Path, name: &str, value: u32) -> io::Result<()> {
     use std::ffi::CString;
     let path_c = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let name_c =
-        CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let name_c = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let data = value.to_string();
     let rc = unsafe {
         // Linux: setxattr(path, name, value, size, flags)
@@ -456,7 +455,8 @@ mod tests {
 
     #[test]
     fn whiteout_removes_file() {
-        let dir = std::env::temp_dir().join(format!("buildkit-whiteout-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("buildkit-whiteout-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let layer = gzip_tar(|tar| {
@@ -508,10 +508,8 @@ mod tests {
     fn finalize_skips_absolute_symlinks() {
         // Images like nginx ship absolute symlinks (lib/ssl/private -> /etc/ssl/private).
         // Walking those with Path::is_dir would escape the rootfs onto the host.
-        let dir = std::env::temp_dir().join(format!(
-            "buildkit-finalize-abs-link-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("buildkit-finalize-abs-link-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("etc/ssl/private")).unwrap();
         fs::create_dir_all(dir.join("lib/ssl")).unwrap();
@@ -529,7 +527,11 @@ mod tests {
                 dir.join("lib/ssl/private"),
             );
         }
-        fs::write(dir.join("pending.buildkit-symlink"), "etc/ssl/private/secret").unwrap();
+        fs::write(
+            dir.join("pending.buildkit-symlink"),
+            "etc/ssl/private/secret",
+        )
+        .unwrap();
         finalize_rootfs(&dir).unwrap();
         assert!(
             !dir.join("pending.buildkit-symlink").exists(),
@@ -568,7 +570,11 @@ mod tests {
                 .join("dpkg")
                 .join("info")
                 .join(enc.as_ref());
-            assert!(path.is_file(), "expected encoded file at {}", path.display());
+            assert!(
+                path.is_file(),
+                "expected encoded file at {}",
+                path.display()
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), "ok");
         }
         #[cfg(not(windows))]

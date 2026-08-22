@@ -15,7 +15,7 @@ use tar::{Builder, Header};
 
 use crate::platform::Platform;
 use crate::reference::parse_reference;
-use crate::store::ImageStore;
+use crate::store::{ImageStore, StoredImage, StoredLayer};
 use crate::Error;
 
 /// Image config state accumulated while building a stage.
@@ -69,8 +69,8 @@ impl ImageMeta {
 
 /// Pack `rootfs` as a single gzip layer and write a cached image for each tag.
 #[allow(dead_code)]
-pub fn export_image(
-    store: &ImageStore,
+pub fn export_image<S: ImageStore>(
+    store: &S,
     rootfs: &Path,
     meta: &ImageMeta,
     tags: &[String],
@@ -82,8 +82,8 @@ pub fn export_image(
 }
 
 /// Write tags from an already-packed layer blob (in-memory).
-pub fn export_image_layer(
-    store: &ImageStore,
+pub fn export_image_layer<S: ImageStore>(
+    store: &S,
     layer: &[u8],
     meta: &ImageMeta,
     tags: &[String],
@@ -104,8 +104,8 @@ pub fn export_image_layer(
 }
 
 /// Write tags by copying a packed layer file (avoids loading large blobs into RAM).
-pub fn export_image_layer_file(
-    store: &ImageStore,
+pub fn export_image_layer_file<S: ImageStore>(
+    store: &S,
     layer_path: &Path,
     digest: &str,
     meta: &ImageMeta,
@@ -125,8 +125,8 @@ pub fn export_image_layer_file(
     )
 }
 
-fn export_image_with_digest(
-    store: &ImageStore,
+fn export_image_with_digest<S: ImageStore>(
+    store: &S,
     layer_bytes: Option<&[u8]>,
     layer_path: Option<&Path>,
     digest: &str,
@@ -139,44 +139,33 @@ fn export_image_with_digest(
         return Err(Error::other("build requires at least one tag"));
     }
 
+    let config = build_config_file(meta, platform, history_comment);
     let mut refs = Vec::new();
 
     for tag in tags {
         let reference = parse_reference(tag)?;
-        let dir = store.image_dir(&reference, platform);
-        if dir.join("digest").is_file()
-            && fs::read_to_string(dir.join("digest"))
-                .map(|d| d.trim() == digest)
-                .unwrap_or(false)
-            && dir.join("layers").join("0.tar.gz").is_file()
-        {
+        if store.has_digest(&reference, platform, digest) {
             refs.push(reference);
             continue;
         }
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
-        }
-        let layers_dir = dir.join("layers");
-        fs::create_dir_all(&layers_dir)?;
-        let dest_layer = layers_dir.join("0.tar.gz");
         if let Some(bytes) = layer_bytes {
-            fs::write(&dest_layer, bytes)?;
+            store.put_image(
+                &reference,
+                platform,
+                StoredImage {
+                    digest: Some(digest.to_string()),
+                    config: config.clone(),
+                    layers: vec![StoredLayer {
+                        digest: Some(digest.to_string()),
+                        data: bytes.to_vec(),
+                    }],
+                },
+            )?;
         } else if let Some(src) = layer_path {
-            fs::copy(src, &dest_layer)?;
+            store.put_image_layer_file(&reference, platform, digest, &config, src)?;
         } else {
             return Err(Error::other("export: missing layer data"));
         }
-        fs::write(
-            dir.join("platform"),
-            format!("{}/{}", platform.os, platform.architecture),
-        )?;
-
-        let config = build_config_file(meta, platform, history_comment);
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_string_pretty(&config)?,
-        )?;
-        fs::write(dir.join("digest"), digest)?;
         refs.push(reference);
     }
     Ok(refs)
@@ -243,11 +232,7 @@ fn build_config_file(meta: &ImageMeta, platform: &Platform, comment: &str) -> Co
     }
 }
 
-fn add_dir<W: Write>(
-    archive: &mut Builder<W>,
-    dir: &Path,
-    prefix: &Path,
-) -> Result<(), Error> {
+fn add_dir<W: Write>(archive: &mut Builder<W>, dir: &Path, prefix: &Path) -> Result<(), Error> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -287,11 +272,7 @@ pub fn layer_digest(data: &[u8]) -> String {
 }
 
 pub(crate) fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Working directory for an in-progress build under the data root.

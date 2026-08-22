@@ -7,7 +7,8 @@ This crate pulls base images, applies Dockerfile instructions, and writes the re
 ## Features
 
 - Multi-stage Dockerfiles, including `COPY --from`
-- Local layer cache with a pluggable [`CacheHandler`](src/cache/handler.rs) (OS-specific defaults)
+- Local overlay2 layer cache
+- Pluggable [`ImageStore`](src/store.rs) for configs and layer blobs
 - `.dockerignore` filtering
 - Registry pulls with Docker-style progress events
 - Registry auth from `~/.docker/config.json` or environment variables
@@ -33,14 +34,11 @@ buildkit = "0.1"
 Build a context directory that contains a `Dockerfile`:
 
 ```rust
-use buildkit::{BuildRequest, Buildkit, ImageStore, NoopBackend};
+use buildkit::{BuildRequest, Buildkit, NoopBackend};
 
 #[tokio::main]
 async fn main() -> Result<(), buildkit::Error> {
-    let kit = Buildkit::new(
-        NoopBackend,
-        ImageStore::new("/var/lib/buildkit".into()),
-    )?;
+    let kit = Buildkit::new(NoopBackend)?;
 
     let result = kit
         .build(
@@ -101,10 +99,10 @@ impl Backend for MyRuntime {
 You can pull and materialize a rootfs without a full Dockerfile build:
 
 ```rust
-use buildkit::{default_pull_platform, ensure_rootfs, ImageStore};
+use buildkit::{default_pull_platform, ensure_rootfs, LocalImageStore};
 
 async fn pull_alpine() -> Result<(), buildkit::Error> {
-    let store = ImageStore::new("/var/lib/buildkit".into());
+    let store = LocalImageStore::new("/var/lib/buildkit".into());
     ensure_rootfs(
         &store,
         "alpine:3.19",
@@ -137,19 +135,28 @@ impl BuildProgress for Printer {
 
 Then call `kit.build_with_progress(request, &mut Printer).await`.
 
-### Cache handler
+### Image store
 
-Instruction snapshots are stored through a `CacheHandler`. `Buildkit::new` installs an OS-specific default (`LinuxCacheHandler`, `MacosCacheHandler`, or `WindowsCacheHandler`). Those currently use on-disk directory snapshots; each type is the swap point for a platform-specific mechanism.
+Pulled and exported blobs are stored through `ImageStore`. `Buildkit::new` uses the platform-default Docker data-root (`LocalImageStore::default`). Pass `LocalImageStore::new` for another directory, or implement `ImageStore` to control how configs and layer blobs are written.
 
 ```rust
-use buildkit::{Buildkit, CacheHandler, ImageStore, LayerCache, NoopBackend};
+use buildkit::{Buildkit, ImageStore, LocalImageStore, NoopBackend};
 
-fn with_custom_cache(handler: impl CacheHandler + 'static) -> Result<(), buildkit::Error> {
-    let _kit = Buildkit::new(NoopBackend, ImageStore::new("/var/lib/buildkit".into()))?
-        .with_cache(LayerCache::with_handler(handler));
+fn with_custom_store(store: impl ImageStore) -> Result<(), buildkit::Error> {
+    let _kit = Buildkit::with_image_store(NoopBackend, store)?;
+    Ok(())
+}
+
+fn with_local_dir() -> Result<(), buildkit::Error> {
+    let _kit = Buildkit::with_image_store(
+        NoopBackend,
+        LocalImageStore::new("/var/lib/buildkit".into()),
+    )?;
     Ok(())
 }
 ```
+
+Overlay2 instruction snapshots still live under `ImageStore::root()` (a writable host path), because `RUN` and `COPY` need real files.
 
 ### Registry authentication
 
@@ -163,12 +170,12 @@ Override the config directory with `buildkit::set_config_dir`. Docker itself doe
 
 ## Store layout
 
-`ImageStore` keeps pulled images, layer cache, and scratch work under a single root:
+`LocalImageStore` keeps pulled images, layer cache, and scratch work under a single root:
 
 ```
 <store>/
   images/     # pulled / exported image config and layers
-  cache/      # instruction chain snapshots
+  overlay2/   # instruction cache (Docker overlay2: diff/, lower, link)
   work/       # temporary stage rootfs during a build
 ```
 

@@ -12,28 +12,30 @@ use crate::progress::{BuildProgress, NullProgress, PullProgress};
 use crate::pull::{pull_image, pull_image_with_progress, PulledImage};
 use crate::reference::parse_reference;
 use crate::request::{BuildRequest, BuildResult};
-use crate::store::ImageStore;
+use crate::store::{ImageStore, LocalImageStore};
 use crate::Error;
 
 /// Builds OCI images from Dockerfiles.
 ///
-/// `B` is the runtime that executes `RUN` instructions. Pull, unpack, `COPY`,
-/// `ADD`, layer cache, and image export stay in this crate.
+/// `B` is the runtime that executes `RUN` instructions. `S` is the
+/// [`ImageStore`] that holds pulled and exported blobs. Pull, unpack, `COPY`,
+/// `ADD`, overlay2 layer cache, and image export stay in this crate.
 ///
-/// Images and cache live under the [`ImageStore`] passed to [`Self::new`]:
+/// Images live in `S`. Overlay2 cache and scratch work live under
+/// [`ImageStore::root`] unless you override them:
 ///
 /// ```text
-/// <store>/
-///   images/   pulled and exported image config and layers
-///   cache/    instruction chain snapshots
-///   work/     temporary stage rootfs during a build
+/// <store.root()>/
+///   images/    pulled and exported image config and layers (LocalImageStore)
+///   overlay2/  instruction cache (Docker overlay2 layers)
+///   work/      temporary stage rootfs during a build
 /// ```
 ///
 /// ```no_run
-/// use buildkit::{BuildRequest, Buildkit, ImageStore, NoopBackend};
+/// use buildkit::{BuildRequest, Buildkit, NoopBackend};
 ///
 /// # async fn example() -> Result<(), buildkit::Error> {
-/// let kit = Buildkit::new(NoopBackend, ImageStore::new("/var/lib/buildkit".into()))?;
+/// let kit = Buildkit::new(NoopBackend)?;
 /// let result = kit
 ///     .build(BuildRequest::new(".").tag("myapp:latest"))
 ///     .await?;
@@ -41,17 +43,31 @@ use crate::Error;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Buildkit<B> {
+pub struct Buildkit<B, S = LocalImageStore> {
     backend: B,
-    store: ImageStore,
+    store: S,
     cache: LayerCache,
     work_root: PathBuf,
 }
 
-impl<B> Buildkit<B> {
-    /// Create a builder that stores images under `store` and uses the OS-default
-    /// [`crate::CacheHandler`] for the instruction cache.
-    pub fn new(backend: B, store: ImageStore) -> Result<Self, Error> {
+impl<B: Default> Buildkit<B, LocalImageStore> {
+    /// Construct with `B::default()` and the platform-default Docker overlay2 store.
+    pub fn default() -> Result<Self, Error> {
+        Self::new(B::default())
+    }
+}
+
+impl<B> Buildkit<B, LocalImageStore> {
+    /// Create a builder with `backend` and the platform-default
+    /// [`LocalImageStore`] ([`LocalImageStore::default`]).
+    pub fn new(backend: B) -> Result<Self, Error> {
+        Self::with_image_store(backend, LocalImageStore::default())
+    }
+}
+
+impl<B, S: ImageStore> Buildkit<B, S> {
+    /// Create a builder with `backend` and a caller-provided [`ImageStore`].
+    pub fn with_image_store(backend: B, store: S) -> Result<Self, Error> {
         let cache = LayerCache::open(store.root())?;
         let work_root = store.root().join("work");
         Ok(Self {
@@ -62,30 +78,24 @@ impl<B> Buildkit<B> {
         })
     }
 
-    /// Override the layer cache (defaults to the OS [`crate::CacheHandler`] under
-    /// `<store>/cache`).
+    /// Override the overlay2 layer cache (defaults to `<store.root()>/overlay2`).
     pub fn with_cache(mut self, cache: LayerCache) -> Self {
         self.cache = cache;
         self
     }
 
-    /// Use a custom [`crate::CacheHandler`] for instruction-layer storage.
-    pub fn with_cache_handler(self, handler: impl crate::CacheHandler + 'static) -> Self {
-        self.with_cache(LayerCache::with_handler(handler))
-    }
-
-    /// Override the temporary build-work directory (defaults to `<store>/work`).
+    /// Override the temporary build-work directory (defaults to `<store.root()>/work`).
     pub fn with_work_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.work_root = dir.into();
         self
     }
 
     /// Image store this builder reads and writes.
-    pub fn store(&self) -> &ImageStore {
+    pub fn store(&self) -> &S {
         &self.store
     }
 
-    /// Layer cache used for instruction snapshots (defaults to `<store>/cache`).
+    /// Overlay2 layer cache used for instruction snapshots.
     pub fn cache(&self) -> &LayerCache {
         &self.cache
     }
@@ -101,7 +111,7 @@ impl<B> Buildkit<B> {
     }
 }
 
-impl<B: Backend> Buildkit<B> {
+impl<B: Backend, S: ImageStore> Buildkit<B, S> {
     /// Parse a Dockerfile and execute it against the configured backend.
     ///
     /// Tags the result as `buildkit:latest` when [`BuildRequest::tags`] is empty.
@@ -220,7 +230,9 @@ mod tests {
         std::fs::write(ctx.join("Dockerfile"), "FROM scratch\nRUN echo hello\n").unwrap();
 
         let capture = Capture::default();
-        let kit = Buildkit::new(capture.clone(), ImageStore::new(root.join("store"))).unwrap();
+        let kit =
+            Buildkit::with_image_store(capture.clone(), LocalImageStore::new(root.join("store")))
+                .unwrap();
         kit.build(BuildRequest::new(&ctx).tag("run-test:latest"))
             .await
             .unwrap();
@@ -248,7 +260,8 @@ mod tests {
         )
         .unwrap();
 
-        let kit = Buildkit::new(NoopBackend, ImageStore::new(root.join("store"))).unwrap();
+        let kit = Buildkit::with_image_store(NoopBackend, LocalImageStore::new(root.join("store")))
+            .unwrap();
         let result = kit
             .build(BuildRequest::new(&ctx).tag("scratch-test:latest"))
             .await

@@ -1,6 +1,5 @@
-//! Pull images from OCI registries into a local [`crate::ImageStore`].
+//! Pull images from OCI registries into a [`crate::ImageStore`].
 
-use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -8,9 +7,9 @@ use std::time::{Duration, Instant};
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use oci_distribution::client::ClientConfig;
 use oci_distribution::config::ConfigFile;
+use oci_distribution::manifest::OciDescriptor;
 use oci_distribution::manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE;
 use oci_distribution::manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE;
-use oci_distribution::manifest::OciDescriptor;
 use oci_distribution::Client;
 use oci_distribution::Reference;
 
@@ -19,7 +18,7 @@ use crate::platform::default_pull_platform;
 use crate::platform::platform_resolver;
 use crate::platform::Platform;
 use crate::progress::{short_layer_id, NullProgress, PullEvent, PullProgress};
-use crate::store::ImageStore;
+use crate::store::{ImageStore, StoredImage, StoredLayer};
 use crate::Error;
 
 /// Accepted OCI/Docker layer media types.
@@ -41,8 +40,6 @@ pub struct PulledImage {
     pub platform: Platform,
     /// Image config from the registry (or the local cache on an up-to-date hit).
     pub config: ConfigFile,
-    /// Directory under the store that holds `config.json`, `digest`, and layers.
-    pub cache_dir: std::path::PathBuf,
     /// Full layer digests in manifest order (for unpack progress).
     pub layer_digests: Vec<String>,
     /// Manifest digest when the registry returned one.
@@ -90,8 +87,8 @@ fn pulling_from_parts(reference: &Reference) -> (String, String) {
 ///
 /// Skips re-downloading layers when the local digest already matches the
 /// registry. Progress events are discarded; see [`pull_image_with_progress`].
-pub async fn pull_image(
-    store: &ImageStore,
+pub async fn pull_image<S: ImageStore>(
+    store: &S,
     reference: &Reference,
     platform: &Platform,
 ) -> Result<PulledImage, Error> {
@@ -102,15 +99,12 @@ pub async fn pull_image(
 ///
 /// Does not emit the final `Digest` / `Status` lines — call
 /// [`finish_pull_progress`] after unpacking so ordering matches Docker.
-pub async fn pull_image_with_progress(
-    store: &ImageStore,
+pub async fn pull_image_with_progress<S: ImageStore>(
+    store: &S,
     reference: &Reference,
     platform: &Platform,
     progress: &mut dyn PullProgress,
 ) -> Result<PulledImage, Error> {
-    let cache_dir = store.image_dir(reference, platform);
-    fs::create_dir_all(&cache_dir)?;
-
     let client = client_for_platform(platform);
     let auth = auth_for_reference(reference);
     tracing::debug!(image = %reference, os = %platform.os, arch = %platform.architecture, "fetching manifest and layers");
@@ -118,23 +112,23 @@ pub async fn pull_image_with_progress(
     let (tag, repository) = pulling_from_parts(reference);
     progress.event(PullEvent::PullingFrom { tag, repository });
 
-    let (manifest, digest, config_blob) = client
-        .pull_manifest_and_config(reference, &auth)
-        .await?;
+    let (manifest, digest, config_blob) = client.pull_manifest_and_config(reference, &auth).await?;
     validate_layer_media_types(&manifest.layers)?;
 
     let layer_digests: Vec<String> = manifest.layers.iter().map(|l| l.digest.clone()).collect();
 
     // Docker `--pull=always`: still consult the registry, but skip re-download
     // when the local digest and layer blobs already match.
-    if layers_cache_matches(&cache_dir, &digest, &layer_digests) {
-        let config = read_cached_config(&cache_dir, &config_blob)?;
+    if store.layers_match(reference, platform, &digest, &layer_digests) {
+        let config = store.image_config(reference, platform).or_else(|_| {
+            serde_json::from_str(&config_blob)
+                .map_err(|e| Error::other(format!("image config: {e}")))
+        })?;
         tracing::debug!(image = %reference, %digest, "image already up to date");
         return Ok(PulledImage {
             reference: reference.clone(),
             platform: platform.clone(),
             config,
-            cache_dir,
             layer_digests,
             digest: if digest.is_empty() {
                 None
@@ -145,15 +139,8 @@ pub async fn pull_image_with_progress(
         });
     }
 
-    let config: ConfigFile = serde_json::from_str(&config_blob).map_err(|e| {
-        Error::other(format!("image config: {e}"))
-    })?;
-
-    let layers_dir = cache_dir.join("layers");
-    if layers_dir.exists() {
-        fs::remove_dir_all(&layers_dir)?;
-    }
-    fs::create_dir_all(&layers_dir)?;
+    let config: ConfigFile = serde_json::from_str(&config_blob)
+        .map_err(|e| Error::other(format!("image config: {e}")))?;
 
     let progress = Arc::new(Mutex::new(progress));
 
@@ -181,9 +168,8 @@ pub async fn pull_image_with_progress(
                 let mut data = Vec::with_capacity(total.min(64 * 1024 * 1024) as usize);
                 let mut last_emit = Instant::now() - PROGRESS_MIN_INTERVAL;
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(|e| {
-                        Error::other(format!("failed to download layer {id}: {e}"))
-                    })?;
+                    let chunk = chunk
+                        .map_err(|e| Error::other(format!("failed to download layer {id}: {e}")))?;
                     data.extend_from_slice(&chunk);
                     let now = Instant::now();
                     if now.duration_since(last_emit) >= PROGRESS_MIN_INTERVAL {
@@ -226,33 +212,33 @@ pub async fn pull_image_with_progress(
         ordered[index] = data;
     }
 
-    for (index, data) in ordered.into_iter().enumerate() {
-        let path = layers_dir.join(format!("{index}.tar.gz"));
-        fs::write(&path, &data)?;
-    }
-    fs::write(
-        layers_dir.join("digests"),
-        layer_digests.join("\n") + "\n",
-    )?;
+    let layers: Vec<StoredLayer> = ordered
+        .into_iter()
+        .zip(layer_digests.iter())
+        .map(|(data, digest)| StoredLayer {
+            digest: Some(digest.clone()),
+            data,
+        })
+        .collect();
 
-    fs::write(
-        cache_dir.join("config.json"),
-        serde_json::to_string_pretty(&config)?,
+    store.put_image(
+        reference,
+        platform,
+        StoredImage {
+            digest: if digest.is_empty() {
+                None
+            } else {
+                Some(digest.clone())
+            },
+            config: config.clone(),
+            layers,
+        },
     )?;
-    fs::write(
-        cache_dir.join("platform"),
-        format!("{}/{}", platform.os, platform.architecture),
-    )?;
-
-    if !digest.is_empty() {
-        fs::write(cache_dir.join("digest"), &digest)?;
-    }
 
     Ok(PulledImage {
         reference: reference.clone(),
         platform: platform.clone(),
         config,
-        cache_dir,
         layer_digests,
         digest: if digest.is_empty() {
             None
@@ -261,48 +247,6 @@ pub async fn pull_image_with_progress(
         },
         updated: true,
     })
-}
-
-fn layers_cache_matches(cache_dir: &Path, digest: &str, layer_digests: &[String]) -> bool {
-    if digest.is_empty() {
-        return false;
-    }
-    let Ok(local) = fs::read_to_string(cache_dir.join("digest")) else {
-        return false;
-    };
-    if local.trim() != digest.trim() {
-        return false;
-    }
-    if !cache_dir.join("config.json").is_file() {
-        return false;
-    }
-    let layers_dir = cache_dir.join("layers");
-    let Ok(stored) = fs::read_to_string(layers_dir.join("digests")) else {
-        return false;
-    };
-    let stored: Vec<&str> = stored.lines().filter(|l| !l.is_empty()).collect();
-    if stored.len() != layer_digests.len() {
-        return false;
-    }
-    for (i, expected) in layer_digests.iter().enumerate() {
-        if stored.get(i).copied() != Some(expected.as_str()) {
-            return false;
-        }
-        let blob = layers_dir.join(format!("{i}.tar.gz"));
-        if !blob.is_file() {
-            return false;
-        }
-    }
-    true
-}
-
-fn read_cached_config(cache_dir: &Path, config_blob: &str) -> Result<ConfigFile, Error> {
-    match fs::read_to_string(cache_dir.join("config.json")) {
-        Ok(s) => serde_json::from_str(&s)
-            .map_err(|e| Error::other(format!("cached image config: {e}"))),
-        Err(_) => serde_json::from_str(config_blob)
-            .map_err(|e| Error::other(format!("image config: {e}"))),
-    }
 }
 
 /// Emit the final Docker pull footer (`Digest` + `Status`).
@@ -326,8 +270,8 @@ pub fn finish_pull_progress(
 }
 
 /// Pull `image`, unpack its layers into `dest`, and return the resolved reference.
-pub async fn pull_and_materialize(
-    store: &ImageStore,
+pub async fn pull_and_materialize<S: ImageStore>(
+    store: &S,
     image: &str,
     dest: &Path,
     platform: &Platform,
@@ -339,8 +283,8 @@ pub async fn pull_and_materialize(
 }
 
 /// Pull `reference` using [`crate::default_pull_platform`].
-pub async fn pull_image_default(
-    store: &ImageStore,
+pub async fn pull_image_default<S: ImageStore>(
+    store: &S,
     reference: &Reference,
 ) -> Result<PulledImage, Error> {
     pull_image(store, reference, &default_pull_platform()).await

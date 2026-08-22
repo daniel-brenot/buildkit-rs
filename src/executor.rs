@@ -38,8 +38,8 @@ struct StageState {
     layer_id: String,
 }
 
-pub async fn build<B: Backend>(
-    kit: &Buildkit<B>,
+pub async fn build<B: Backend, S: ImageStore>(
+    kit: &Buildkit<B, S>,
     request: BuildRequest,
     progress: &mut dyn BuildProgress,
 ) -> Result<BuildResult, Error> {
@@ -125,10 +125,7 @@ pub async fn build<B: Backend>(
         let id_from = progress.start(from_name);
 
         if !base_as_scratch {
-            if let Err(e) = kit
-                .ensure_image(&base, &stage_platform, request.pull)
-                .await
-            {
+            if let Err(e) = kit.ensure_image(&base, &stage_platform, request.pull).await {
                 progress.error(id_from, e.to_string(), t0.elapsed());
                 return Err(e);
             }
@@ -173,8 +170,12 @@ pub async fn build<B: Backend>(
                 if !base_as_scratch {
                     progress.status(id_from, format!("resolve {base}"));
                     let bundle = stage_dir.join("base-rootfs");
-                    if let Err(e) = materialize_rootfs(kit.store(), &parse_reference(&base)?, &stage_platform, &bundle)
-                    {
+                    if let Err(e) = materialize_rootfs(
+                        kit.store(),
+                        &parse_reference(&base)?,
+                        &stage_platform,
+                        &bundle,
+                    ) {
                         progress.error(id_from, e.to_string(), t0.elapsed());
                         return Err(e);
                     }
@@ -191,15 +192,9 @@ pub async fn build<B: Backend>(
                     Ok(mut s) => {
                         s.work_rootfs = rootfs.clone();
                         s.layer_id = from_id.clone();
-                        let _ = kit.cache().save(
-                            &from_id,
-                            "",
-                            &from_key,
-                            &s.meta,
-                            &s.args,
-                            &s.rootfs,
-                            true,
-                        );
+                        let _ = kit
+                            .cache()
+                            .save(&from_id, "", &from_key, &s.meta, &s.args, &s.rootfs, true);
                         progress.done(id_from, t0.elapsed());
                         parent_id = from_id.clone();
                         s
@@ -315,7 +310,16 @@ pub async fn build<B: Backend>(
     let final_state = last_state.ok_or_else(|| Error::other("no build stage produced"))?;
     let t0 = Instant::now();
     let id_export = progress.start("[internal] exporting to image");
-    let refs = export_final(kit.store(), kit.cache(), &final_state, &tags, &platform, &mut progress, id_export, t0)?;
+    let refs = export_final(
+        kit.store(),
+        kit.cache(),
+        &final_state,
+        &tags,
+        &platform,
+        &mut progress,
+        id_export,
+        t0,
+    )?;
     progress.done(id_export, t0.elapsed());
 
     let _ = fs::remove_dir_all(&work);
@@ -328,8 +332,8 @@ pub async fn build<B: Backend>(
     Ok(BuildResult { tags, image_ids })
 }
 
-fn export_final(
-    store: &ImageStore,
+fn export_final<S: ImageStore>(
+    store: &S,
     cache: &LayerCache,
     final_state: &StageState,
     tags: &[String],
@@ -435,7 +439,12 @@ fn instruction_summary(inst: &Instruction, state: &StageState) -> String {
                 .iter()
                 .map(|s| expand::expand(s, &vars))
                 .collect();
-            match copy.flags.iter().find(|f| f.is("from")).and_then(|f| f.value.as_deref()) {
+            match copy
+                .flags
+                .iter()
+                .find(|f| f.is("from"))
+                .and_then(|f| f.value.as_deref())
+            {
                 Some(f) => format!("COPY --from={f} {} {dest}", srcs.join(" ")),
                 None => format!("COPY {} {dest}", srcs.join(" ")),
             }
@@ -491,11 +500,7 @@ fn instruction_summary(inst: &Instruction, state: &StageState) -> String {
             format!("EXPOSE {}", ports.join(" "))
         }
         Instruction::Volume(vol) => {
-            let vols: Vec<_> = vol
-                .paths
-                .iter()
-                .map(|v| expand::expand(v, &vars))
-                .collect();
+            let vols: Vec<_> = vol.paths.iter().map(|v| expand::expand(v, &vars)).collect();
             format!("VOLUME {}", vols.join(" "))
         }
         other => other.keyword().to_string(),
@@ -545,8 +550,8 @@ fn resolve_global_args(
     out
 }
 
-fn init_stage_from_image(
-    store: &ImageStore,
+fn init_stage_from_image<S: ImageStore>(
+    store: &S,
     platform: &Platform,
     base: &str,
     base_as_scratch: bool,
@@ -567,28 +572,21 @@ fn init_stage_from_image(
             copy_tree(&bundle, rootfs)?;
         }
         if let Ok(reference) = parse_reference(base) {
-            let cfg_path = store.image_dir(&reference, platform).join("config.json");
-            if cfg_path.is_file() {
-                if let Ok(data) = fs::read_to_string(&cfg_path) {
-                    if let Ok(cfg) =
-                        serde_json::from_str::<oci_distribution::config::ConfigFile>(&data)
-                    {
-                        if let Some(c) = cfg.config {
-                            if let Some(env) = c.env {
-                                meta.env = env;
-                            }
-                            if let Some(wd) = c.working_dir {
-                                if !wd.is_empty() {
-                                    meta.working_dir = wd;
-                                }
-                            }
-                            meta.user = c.user;
-                            meta.entrypoint = c.entrypoint;
-                            meta.cmd = c.cmd;
-                            if let Some(labels) = c.labels {
-                                meta.labels = labels;
-                            }
+            if let Ok(cfg) = store.image_config(&reference, platform) {
+                if let Some(c) = cfg.config {
+                    if let Some(env) = c.env {
+                        meta.env = env;
+                    }
+                    if let Some(wd) = c.working_dir {
+                        if !wd.is_empty() {
+                            meta.working_dir = wd;
                         }
+                    }
+                    meta.user = c.user;
+                    meta.entrypoint = c.entrypoint;
+                    meta.cmd = c.cmd;
+                    if let Some(labels) = c.labels {
+                        meta.labels = labels;
                     }
                 }
             }
@@ -608,10 +606,7 @@ fn init_stage_from_image(
 fn instruction_needs_writable(inst: &Instruction) -> bool {
     matches!(
         inst,
-        Instruction::Run(_)
-            | Instruction::Copy(_)
-            | Instruction::Add(_)
-            | Instruction::Workdir(_)
+        Instruction::Run(_) | Instruction::Copy(_) | Instruction::Add(_) | Instruction::Workdir(_)
     )
 }
 
@@ -630,8 +625,8 @@ fn prepare_writable(state: &mut StageState) -> Result<(), Error> {
     Ok(())
 }
 
-async fn apply_instruction<B: Backend>(
-    kit: &Buildkit<B>,
+async fn apply_instruction<B: Backend, S: ImageStore>(
+    kit: &Buildkit<B, S>,
     state: &mut StageState,
     inst: &Instruction,
     context: &BuildContext,
@@ -679,10 +674,18 @@ async fn apply_instruction<B: Backend>(
             state.meta.user = Some(expand::expand(&user.spec, &merged_vars(state)));
         }
         Instruction::Entrypoint(ep) => {
-            state.meta.entrypoint = Some(command_to_args(&ep.command, &state.meta.shell, &merged_vars(state)));
+            state.meta.entrypoint = Some(command_to_args(
+                &ep.command,
+                &state.meta.shell,
+                &merged_vars(state),
+            ));
         }
         Instruction::Cmd(cmd) => {
-            state.meta.cmd = Some(command_to_args(&cmd.command, &state.meta.shell, &merged_vars(state)));
+            state.meta.cmd = Some(command_to_args(
+                &cmd.command,
+                &state.meta.shell,
+                &merged_vars(state),
+            ));
         }
         Instruction::Expose(ex) => {
             for p in &ex.ports {
@@ -819,9 +822,9 @@ fn apply_copy(
     for src in sources {
         let src = expand::expand(src, &merged_vars(state));
         if let Some(stage_name) = from {
-            let donor = completed.get(stage_name).ok_or_else(|| {
-                Error::other(format!("unknown COPY --from stage '{stage_name}'"))
-            })?;
+            let donor = completed
+                .get(stage_name)
+                .ok_or_else(|| Error::other(format!("unknown COPY --from stage '{stage_name}'")))?;
             let src_host = if src.starts_with('/') {
                 guest_to_host(&donor.rootfs, &src)
             } else {
@@ -858,7 +861,8 @@ async fn apply_add(
                     "when ADD has multiple sources, destination must be a directory",
                 ));
             }
-            let target = url_dest_path(&dest_host, dest_is_dir || multi || dest_host.is_dir(), &src)?;
+            let target =
+                url_dest_path(&dest_host, dest_is_dir || multi || dest_host.is_dir(), &src)?;
             download_url(&src, &target).await?;
         } else {
             local.push(src);
@@ -947,8 +951,8 @@ fn copy_dest_path(
     }
 }
 
-async fn run_in_rootfs<B: Backend>(
-    kit: &Buildkit<B>,
+async fn run_in_rootfs<B: Backend, S: ImageStore>(
+    kit: &Buildkit<B, S>,
     state: &StageState,
     args: Vec<String>,
     network: NetworkMode,
@@ -969,11 +973,7 @@ async fn run_in_rootfs<B: Backend>(
         user: state.meta.user.clone(),
         network,
     };
-    let result = kit
-        .backend()
-        .run(&request)
-        .await
-        .map_err(Error::backend)?;
+    let result = kit.backend().run(&request).await.map_err(Error::backend)?;
     if !result.is_success() {
         return Err(Error::other(format!(
             "RUN failed with exit code {}",

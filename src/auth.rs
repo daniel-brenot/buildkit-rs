@@ -33,13 +33,17 @@ static CONFIG_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
 /// `BUILDKIT_CONFIG`, then `~/.docker`. Pass `Some` to force a directory
 /// (tests, isolated clients). Docker itself does not need to be installed.
 pub fn set_config_dir(path: Option<PathBuf>) {
-    let mut guard = CONFIG_DIR_OVERRIDE.write().unwrap_or_else(|e| e.into_inner());
+    let mut guard = CONFIG_DIR_OVERRIDE
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     *guard = path;
 }
 
 fn docker_config_path() -> Option<PathBuf> {
     {
-        let guard = CONFIG_DIR_OVERRIDE.read().unwrap_or_else(|e| e.into_inner());
+        let guard = CONFIG_DIR_OVERRIDE
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(dir) = guard.as_ref() {
             return Some(dir.join("config.json"));
         }
