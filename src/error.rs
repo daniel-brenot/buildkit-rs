@@ -58,6 +58,22 @@ impl Error {
             source,
         }
     }
+
+    /// Whether this is an I/O error for a missing path.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            Error::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
+    /// Raw OS error code when this is an I/O failure.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Error::Io { source, .. } => source.raw_os_error(),
+            _ => None,
+        }
+    }
 }
 
 #[allow(dead_code)]

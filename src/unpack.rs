@@ -1,11 +1,12 @@
-use std::fs;
 use std::io::Read;
 use std::io::{self};
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::fs::FileSystem;
 use crate::winpath;
+use crate::Error;
 use flate2::read::GzDecoder;
 use tar::Archive;
 use tar::EntryType;
@@ -13,76 +14,8 @@ use tar::EntryType;
 const WHITEOUT_PREFIX: &str = ".wh.";
 const WHITEOUT_OPAQUE: &str = ".wh..wh..opq";
 
-/// Guest-visible ownership (host inode stays owned by the unpacking user).
-#[cfg(unix)]
-const XATTR_UID: &str = "user.buildkit.uid";
-#[cfg(unix)]
-const XATTR_GID: &str = "user.buildkit.gid";
-
-#[cfg(unix)]
-fn set_virtual_owner(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    setxattr_u32(path, XATTR_UID, uid)?;
-    setxattr_u32(path, XATTR_GID, gid)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn setxattr_u32(path: &Path, name: &str, value: u32) -> io::Result<()> {
-    use std::ffi::CString;
-    let path_c = CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let name_c = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let data = value.to_string();
-    let rc = unsafe {
-        // Linux: setxattr(path, name, value, size, flags)
-        // macOS: setxattr(path, name, value, size, position, options)
-        #[cfg(target_os = "macos")]
-        {
-            libc::setxattr(
-                path_c.as_ptr(),
-                name_c.as_ptr(),
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                0,
-                0,
-            )
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            libc::setxattr(
-                path_c.as_ptr(),
-                name_c.as_ptr(),
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                0,
-            )
-        }
-    };
-    if rc != 0 {
-        // macOS often rejects user.* xattrs on some volumes; ownership is
-        // best-effort for the Linux ABI layer and must not fail unpack.
-        #[cfg(target_os = "macos")]
-        {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EPERM)
-                || err.kind() == io::ErrorKind::PermissionDenied
-                || err.raw_os_error() == Some(libc::EOPNOTSUPP)
-            {
-                return Ok(());
-            }
-            return Err(err);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(io::Error::last_os_error())
-        }
-    } else {
-        Ok(())
-    }
-}
-
 /// Apply one gzip-compressed tar layer onto `rootfs`.
-pub fn apply_layer(rootfs: &Path, layer: &[u8]) -> io::Result<()> {
+pub fn apply_layer<F: FileSystem>(fs: &F, rootfs: &Path, layer: &[u8]) -> Result<(), Error> {
     let decoder = GzDecoder::new(layer);
     let mut archive = Archive::new(decoder);
     let mut pending_links: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -96,7 +29,7 @@ pub fn apply_layer(rootfs: &Path, layer: &[u8]) -> io::Result<()> {
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name == WHITEOUT_OPAQUE {
                 if let Some(parent) = path.parent() {
-                    clear_directory(&winpath::join_root(rootfs, &parent.to_string_lossy()))?;
+                    clear_directory(fs, &winpath::join_root(rootfs, &parent.to_string_lossy()))?;
                 }
                 continue;
             }
@@ -105,30 +38,25 @@ pub fn apply_layer(rootfs: &Path, layer: &[u8]) -> io::Result<()> {
                     rootfs,
                     &path.parent().unwrap_or(Path::new(".")).to_string_lossy(),
                 );
-                remove_path(&{
-                    let mut p = parent;
-                    winpath::push_guest_rel(&mut p, target);
-                    p
-                })?;
+                let mut p = parent;
+                winpath::push_guest_rel(&mut p, target);
+                fs.remove(&p)?;
                 continue;
             }
         }
-        unpack_entry(&mut entry, rootfs, &path, &mut pending_links)?;
+        unpack_entry(fs, &mut entry, rootfs, &path, &mut pending_links)?;
     }
 
-    // Symlinks often point at files from earlier in the same layer (busybox
-    // applets). Resolve them after the layer is fully extracted.
-    resolve_pending_links(rootfs, &pending_links)?;
+    resolve_pending_links(fs, rootfs, &pending_links)?;
     Ok(())
 }
 
 /// Resolve any leftover deferred links after all layers have been applied.
-pub fn finalize_rootfs(rootfs: &Path) -> io::Result<()> {
+pub fn finalize_rootfs<F: FileSystem>(fs: &F, rootfs: &Path) -> Result<(), Error> {
     let mut pending = Vec::new();
-    collect_sidecar_links(rootfs, rootfs, &mut pending)?;
-    resolve_pending_links(rootfs, &pending)?;
-    // Absolute symlinks resolve against the host root when opened by host path.
-    crate::rootfs::rewrite_absolute_symlinks(rootfs)?;
+    collect_sidecar_links(fs, rootfs, &mut pending)?;
+    resolve_pending_links(fs, rootfs, &pending)?;
+    crate::rootfs::rewrite_absolute_symlinks(fs, rootfs)?;
     Ok(())
 }
 
@@ -142,98 +70,65 @@ fn path_is_safe(path: &Path) -> bool {
         })
 }
 
-fn clear_directory(dir: &Path) -> io::Result<()> {
-    if !dir.is_dir() {
+fn clear_directory<F: FileSystem>(fs: &F, dir: &Path) -> Result<(), Error> {
+    if !fs.is_dir(dir) {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            fs::remove_dir_all(path)?;
+    for entry in fs.read_dir(dir)? {
+        if entry.is_dir && !entry.is_symlink {
+            fs.remove_dir_all(&entry.path)?;
         } else {
-            fs::remove_file(path)?;
+            fs.remove_file(&entry.path)?;
         }
     }
     Ok(())
 }
 
-fn remove_path(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-        Ok(meta) => {
-            if meta.is_dir() && !meta.file_type().is_symlink() {
-                fs::remove_dir_all(path)
-            } else {
-                // Works even when the file mode is 044x (unlike File::create).
-                fs::remove_file(path)
-            }
-        }
-    }
-}
-
-fn unpack_entry<R: Read>(
+fn unpack_entry<F: FileSystem, R: Read>(
+    fs: &F,
     entry: &mut tar::Entry<'_, R>,
     rootfs: &Path,
     path: &Path,
     pending_links: &mut Vec<(PathBuf, PathBuf)>,
-) -> io::Result<()> {
+) -> Result<(), Error> {
     let dest = winpath::join_root(rootfs, &path.to_string_lossy());
     match entry.header().entry_type() {
         EntryType::Directory => {
-            fs::create_dir_all(&dest)?;
+            fs.create_dir_all(&dest)?;
             #[cfg(unix)]
             {
                 let uid = entry.header().uid().unwrap_or(0) as u32;
                 let gid = entry.header().gid().unwrap_or(0) as u32;
-                let _ = set_virtual_owner(&dest, uid, gid);
+                let _ = fs.set_virtual_owner(&dest, uid, gid);
             }
         }
         EntryType::Regular | EntryType::Continuous => {
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+                fs.create_dir_all(parent)?;
             }
-            // Prior layers may have left a read-only file (e.g. mode 0440
-            // sudoers). `File::create` cannot truncate those (EACCES); unlink
-            // first — the directory is still writable by the unpacking user.
-            remove_path(&dest)?;
-            let mut file = fs::File::create(&dest)?;
+            fs.remove(&dest)?;
+            let mut file = fs.create_file(&dest)?;
             io::copy(entry, &mut file)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
                 if let Ok(mode) = entry.header().mode() {
-                    let _ = fs::set_permissions(&dest, fs::Permissions::from_mode(mode));
+                    let _ = fs.set_permissions(&dest, mode);
                 }
                 let uid = entry.header().uid().unwrap_or(0) as u32;
                 let gid = entry.header().gid().unwrap_or(0) as u32;
-                let _ = set_virtual_owner(&dest, uid, gid);
+                let _ = fs.set_virtual_owner(&dest, uid, gid);
             }
         }
         EntryType::Symlink | EntryType::Link => {
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+                fs.create_dir_all(parent)?;
             }
             let link_target = entry.link_name()?.unwrap_or_default();
             if link_target.as_os_str().is_empty() {
                 return Ok(());
             }
-            remove_path(&dest)?;
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&link_target, &dest)?;
-            }
-            #[cfg(windows)]
-            {
-                if !try_windows_symlink(&dest, &link_target)? {
-                    // Fall back: copy the target file (busybox applets) or
-                    // defer until the target exists.
-                    pending_links.push((dest, PathBuf::from(link_target.as_ref())));
-                }
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
+            fs.remove(&dest)?;
+            if !try_symlink(fs, &dest, link_target.as_ref())? {
                 pending_links.push((dest, PathBuf::from(link_target.as_ref())));
             }
         }
@@ -242,58 +137,28 @@ fn unpack_entry<R: Read>(
     Ok(())
 }
 
-#[cfg(windows)]
-fn try_windows_symlink(dest: &Path, link_target: &Path) -> io::Result<bool> {
-    use std::os::windows::fs::symlink_dir;
-    use std::os::windows::fs::symlink_file;
-    let target = link_target.as_os_str().to_string_lossy();
-    // Prefer directory symlink when the target (relative or absolute) is a dir
-    // under common merged-/usr names, or ends with a separator.
-    let as_dir = target.ends_with('/')
-        || target.ends_with('\\')
-        || dest
-            .parent()
-            .map(|p| p.join(link_target).is_dir())
-            .unwrap_or(false);
-    let result = if as_dir {
-        symlink_dir(link_target, dest)
-    } else {
-        symlink_file(link_target, dest)
-    };
-    match result {
+fn try_symlink<F: FileSystem>(fs: &F, dest: &Path, target: &Path) -> Result<bool, Error> {
+    match fs.symlink(target, dest) {
         Ok(()) => Ok(true),
-        // ERROR_PRIVILEGE_NOT_HELD — need Developer Mode / SeCreateSymbolicLinkPrivilege.
-        Err(err) if err.raw_os_error() == Some(1314) => Ok(false),
-        // ERROR_INVALID_NAME — target/name has chars Windows rejects (e.g. ':').
-        Err(err) if err.raw_os_error() == Some(123) => Ok(false),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(err) => Err(err),
+        Err(e) => {
+            // ERROR_PRIVILEGE_NOT_HELD / ERROR_INVALID_NAME / already exists
+            if e.raw_os_error() == Some(1314)
+                || e.raw_os_error() == Some(123)
+                || matches!(&e, Error::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
+            {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
-/// Create a Windows directory junction (no admin rights required).
-#[cfg(windows)]
-fn make_windows_junction(dest: &Path, target: &Path) -> io::Result<bool> {
-    use std::os::windows::process::CommandExt;
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.arg("/C")
-        .arg("mklink")
-        .arg("/J")
-        .arg(dest.as_os_str())
-        .arg(target.as_os_str())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // CREATE_NO_WINDOW — image unpack can create many junctions; without this
-    // each `cmd /C mklink` flashes a console window.
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let status = cmd.status()?;
-    Ok(status.success())
-}
-
-fn resolve_pending_links(rootfs: &Path, pending: &[(PathBuf, PathBuf)]) -> io::Result<()> {
-    // Multiple passes for chains (a -> b -> busybox).
+fn resolve_pending_links<F: FileSystem>(
+    fs: &F,
+    rootfs: &Path,
+    pending: &[(PathBuf, PathBuf)],
+) -> Result<(), Error> {
     let mut remaining: Vec<(PathBuf, PathBuf)> = pending.to_vec();
     for _ in 0..8 {
         if remaining.is_empty() {
@@ -302,45 +167,40 @@ fn resolve_pending_links(rootfs: &Path, pending: &[(PathBuf, PathBuf)]) -> io::R
         let mut next = Vec::new();
         for (dest, target) in remaining {
             let resolved = resolve_link_target(rootfs, &dest, &target);
-            if dest.exists() {
-                // Older unpackers left empty dirs for /bin → usr/bin style links.
-                let empty_dir_placeholder = dest.is_dir()
-                    && resolved.is_dir()
-                    && fs::read_dir(&dest)
-                        .map(|mut d| d.next().is_none())
-                        .unwrap_or(false);
+            if fs.exists(&dest) {
+                let empty_dir_placeholder = fs.is_dir(&dest)
+                    && fs.is_dir(&resolved)
+                    && fs.read_dir(&dest).map(|d| d.is_empty()).unwrap_or(false);
                 if empty_dir_placeholder {
-                    let _ = fs::remove_dir(&dest);
+                    let _ = fs.remove_dir(&dest);
                 } else {
                     continue;
                 }
             }
-            if resolved.is_file() {
+            if fs.is_file(&resolved) {
                 if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
+                    fs.create_dir_all(parent)?;
                 }
-                fs::copy(&resolved, &dest)?;
-            } else if resolved.is_dir() {
-                // Never create an empty placeholder directory for a symlink to a
-                // directory (Debian merged-/usr uses /bin -> usr/bin). On Windows
-                // without symlink privilege, fall back to a directory junction.
+                fs.copy(&resolved, &dest)?;
+            } else if fs.is_dir(&resolved) {
                 if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
+                    fs.create_dir_all(parent)?;
                 }
-                let _ = fs::remove_dir(&dest);
-                #[cfg(windows)]
-                {
-                    if try_windows_symlink(&dest, &target)? {
-                        continue;
-                    }
-                    if make_windows_junction(&dest, &resolved)? {
-                        continue;
-                    }
-                    next.push((dest, target));
+                let _ = fs.remove_dir(&dest);
+                if try_symlink(fs, &dest, &target)? {
+                    continue;
+                }
+                if fs.junction(&resolved, &dest)? {
+                    continue;
                 }
                 #[cfg(not(windows))]
                 {
-                    std::os::unix::fs::symlink(&target, &dest)?;
+                    fs.symlink(&target, &dest)?;
+                    continue;
+                }
+                #[cfg(windows)]
+                {
+                    next.push((dest, target));
                 }
             } else {
                 next.push((dest, target));
@@ -348,13 +208,12 @@ fn resolve_pending_links(rootfs: &Path, pending: &[(PathBuf, PathBuf)]) -> io::R
         }
         remaining = next;
     }
-    // Persist unresolved links so finalize_rootfs can retry after later layers.
     for (dest, target) in remaining {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs.create_dir_all(parent)?;
         }
         let sidecar = sidecar_path(&dest);
-        fs::write(sidecar, target.to_string_lossy().as_bytes())?;
+        fs.write(&sidecar, target.to_string_lossy().as_bytes())?;
     }
     Ok(())
 }
@@ -381,38 +240,34 @@ fn sidecar_path(dest: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn collect_sidecar_links(
-    rootfs: &Path,
+fn collect_sidecar_links<F: FileSystem>(
+    fs: &F,
     dir: &Path,
     out: &mut Vec<(PathBuf, PathBuf)>,
-) -> io::Result<()> {
-    // Use symlink_metadata so absolute guest symlinks (e.g. lib/ssl/private ->
-    // /etc/ssl/private) are not followed into the host filesystem.
-    let meta = match fs::symlink_metadata(dir) {
+) -> Result<(), Error> {
+    let meta = match fs.symlink_metadata(dir) {
         Ok(m) => m,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
+        Err(e) if e.is_not_found() => return Ok(()),
+        Err(e) => return Err(e),
     };
     if !meta.is_dir() {
         return Ok(());
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_sidecar_links(rootfs, &path, out)?;
+    for entry in fs.read_dir(dir)? {
+        let path = entry.path;
+        if entry.is_dir {
+            collect_sidecar_links(fs, &path, out)?;
             continue;
         }
-        if file_type.is_symlink() {
+        if entry.is_symlink {
             continue;
         }
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if let Some(stem) = name.strip_suffix(".buildkit-symlink") {
             let dest = path.with_file_name(stem);
-            let target = PathBuf::from(fs::read_to_string(&path)?.trim());
+            let target = PathBuf::from(fs.read_to_string(&path)?.trim());
             out.push((dest, target));
-            let _ = fs::remove_file(&path);
+            let _ = fs.remove_file(&path);
         }
     }
     Ok(())
@@ -423,6 +278,7 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use std::fs;
     use std::io::Write;
     use tar::Builder;
 
@@ -448,7 +304,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("buildkit-unpack-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        apply_layer(&dir, &layer).unwrap();
+        apply_layer(&crate::fs::LocalFs, &dir, &layer).unwrap();
         assert_eq!(fs::read_to_string(dir.join("hello.txt")).unwrap(), "hello");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -468,7 +324,7 @@ mod tests {
         });
         fs::create_dir_all(dir.join("dir")).unwrap();
         fs::write(dir.join("dir/remove-me"), "x").unwrap();
-        apply_layer(&dir, &layer).unwrap();
+        apply_layer(&crate::fs::LocalFs, &dir, &layer).unwrap();
         assert!(!dir.join("dir/remove-me").exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -495,7 +351,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("buildkit-link-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        apply_layer(&dir, &layer).unwrap();
+        apply_layer(&crate::fs::LocalFs, &dir, &layer).unwrap();
         assert!(dir.join("bin/busybox").is_file());
         assert!(
             dir.join("bin/sh").is_file() || dir.join("bin/sh").is_symlink(),
@@ -532,7 +388,7 @@ mod tests {
             "etc/ssl/private/secret",
         )
         .unwrap();
-        finalize_rootfs(&dir).unwrap();
+        finalize_rootfs(&crate::fs::LocalFs, &dir).unwrap();
         assert!(
             !dir.join("pending.buildkit-symlink").exists(),
             "sidecar should be consumed"
@@ -560,7 +416,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("buildkit-colon-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        apply_layer(&dir, &layer).unwrap();
+        apply_layer(&crate::fs::LocalFs, &dir, &layer).unwrap();
         #[cfg(windows)]
         {
             let enc = crate::winpath::encode_component("libapr1:amd64.list");

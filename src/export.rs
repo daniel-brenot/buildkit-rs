@@ -1,7 +1,6 @@
 //! Export a built rootfs into the local image store.
 
 use std::collections::HashMap;
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::{Builder, Header};
 
+use crate::fs::FileSystem;
 use crate::platform::Platform;
 use crate::reference::parse_reference;
 use crate::store::{ImageStore, StoredImage, StoredLayer};
@@ -77,7 +77,7 @@ pub fn export_image<S: ImageStore>(
     platform: &Platform,
     history_comment: &str,
 ) -> Result<Vec<Reference>, Error> {
-    let layer = pack_rootfs(rootfs)?;
+    let layer = pack_rootfs(store, rootfs)?;
     export_image_layer(store, &layer, meta, tags, platform, history_comment)
 }
 
@@ -172,12 +172,12 @@ fn export_image_with_digest<S: ImageStore>(
 }
 
 /// Pack rootfs into a gzip layer (also used to populate the build cache blob).
-pub fn pack_rootfs(rootfs: &Path) -> Result<Vec<u8>, Error> {
+pub fn pack_rootfs<F: FileSystem>(fs: &F, rootfs: &Path) -> Result<Vec<u8>, Error> {
     let mut encoded = Vec::new();
     {
         let enc = GzEncoder::new(&mut encoded, Compression::fast());
         let mut archive = Builder::new(enc);
-        add_dir(&mut archive, rootfs, Path::new(""))?;
+        add_dir(fs, &mut archive, rootfs, Path::new(""))?;
         let enc = archive
             .into_inner()
             .map_err(|e| Error::other(format!("tar finish: {e}")))?;
@@ -232,14 +232,17 @@ fn build_config_file(meta: &ImageMeta, platform: &Platform, comment: &str) -> Co
     }
 }
 
-fn add_dir<W: Write>(archive: &mut Builder<W>, dir: &Path, prefix: &Path) -> Result<(), Error> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
+fn add_dir<F: FileSystem, W: Write>(
+    fs: &F,
+    archive: &mut Builder<W>,
+    dir: &Path,
+    prefix: &Path,
+) -> Result<(), Error> {
+    for entry in fs.read_dir(dir)? {
+        let name = entry.name;
         let rel = prefix.join(&name);
-        let path = entry.path();
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
+        let path = entry.path;
+        if entry.is_dir {
             let mut header = Header::new_gnu();
             header.set_entry_type(tar::EntryType::Directory);
             header.set_mode(0o755);
@@ -249,9 +252,9 @@ fn add_dir<W: Write>(archive: &mut Builder<W>, dir: &Path, prefix: &Path) -> Res
             archive
                 .append_data(&mut header, tar_path, std::io::empty())
                 .map_err(|e| Error::other(format!("tar dir: {e}")))?;
-            add_dir(archive, &path, &rel)?;
-        } else if ft.is_file() {
-            let data = fs::read(&path)?;
+            add_dir(fs, archive, &path, &rel)?;
+        } else if entry.is_file {
+            let data = fs.read(&path)?;
             let mut header = Header::new_gnu();
             header.set_entry_type(tar::EntryType::Regular);
             header.set_mode(0o644);

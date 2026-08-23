@@ -1,10 +1,10 @@
 //! Rootfs helpers shared by image unpack and stage materialization.
 
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::fs::FileSystem;
 use crate::winpath;
+use crate::Error;
 
 /// Convert absolute symlink targets into rootfs-relative ones.
 ///
@@ -12,31 +12,29 @@ use crate::winpath;
 /// When a sandbox opens those by host path, the kernel resolves the absolute
 /// target against the *host* root. Relative targets keep resolution inside
 /// the rootfs.
-pub fn rewrite_absolute_symlinks(rootfs: &Path) -> io::Result<()> {
-    walk(rootfs, rootfs)
+pub fn rewrite_absolute_symlinks<F: FileSystem>(fs: &F, rootfs: &Path) -> Result<(), Error> {
+    walk(fs, rootfs, rootfs)
 }
 
-fn walk(rootfs: &Path, dir: &Path) -> io::Result<()> {
-    let entries = match fs::read_dir(dir) {
+fn walk<F: FileSystem>(fs: &F, rootfs: &Path, dir: &Path) -> Result<(), Error> {
+    let entries = match fs.read_dir(dir) {
         Ok(e) => e,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.is_not_found() => return Ok(()),
         Err(e) => return Err(e),
     };
     for ent in entries {
-        let ent = ent?;
-        let path = ent.path();
-        let ft = ent.file_type()?;
-        if ft.is_symlink() {
-            rewrite_one(rootfs, &path)?;
-        } else if ft.is_dir() {
-            walk(rootfs, &path)?;
+        let path = ent.path;
+        if ent.is_symlink {
+            rewrite_one(fs, rootfs, &path)?;
+        } else if ent.is_dir {
+            walk(fs, rootfs, &path)?;
         }
     }
     Ok(())
 }
 
-fn rewrite_one(rootfs: &Path, path: &Path) -> io::Result<()> {
-    let target = fs::read_link(path)?;
+fn rewrite_one<F: FileSystem>(fs: &F, rootfs: &Path, path: &Path) -> Result<(), Error> {
+    let target = fs.read_link(path)?;
     let t = target.to_string_lossy();
     if !t.starts_with('/') {
         return Ok(());
@@ -48,20 +46,8 @@ fn rewrite_one(rootfs: &Path, path: &Path) -> io::Result<()> {
     let Some(rel) = path_relative_to(link_dir, &dest) else {
         return Ok(());
     };
-    fs::remove_file(path)?;
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&rel, path)?;
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::os::windows::fs::symlink_file(&rel, path)
-            .or_else(|_| std::os::windows::fs::symlink_dir(&rel, path));
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (rel, path);
-    }
+    fs.remove_file(path)?;
+    let _ = fs.symlink(&rel, path);
     Ok(())
 }
 
@@ -88,6 +74,7 @@ fn path_relative_to(from_dir: &Path, to: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn relative_basic() {

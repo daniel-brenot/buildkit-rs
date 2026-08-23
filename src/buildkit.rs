@@ -68,7 +68,7 @@ impl<B> Buildkit<B, LocalImageStore> {
 impl<B, S: ImageStore> Buildkit<B, S> {
     /// Create a builder with `backend` and a caller-provided [`ImageStore`].
     pub fn with_image_store(backend: B, store: S) -> Result<Self, Error> {
-        let cache = LayerCache::open(store.root())?;
+        let cache = LayerCache::open(&store, store.root())?;
         let work_root = store.root().join("work");
         Ok(Self {
             backend,

@@ -1,26 +1,27 @@
 //! Storage for pulled and exported image configs and layer blobs.
 
-use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 
 use oci_distribution::config::ConfigFile;
 use oci_distribution::Reference;
 
+use crate::fs::{impl_filesystem_via_localfs, FileSystem};
 use crate::platform::Platform;
 use crate::Error;
 
-/// Storage for pulled and exported images.
+/// Storage for pulled and exported images, and the filesystem used for every
+/// build I/O.
 ///
-/// [`Buildkit`](`crate::Buildkit`) reads and writes configs and layer blobs
-/// through this trait. [`LocalImageStore`] is the default: Docker's data-root
-/// layout on the local filesystem. Implement this to control how blobs are
-/// stored (another directory layout, a content-addressed CAS, a remote store).
+/// [`FileSystem`] methods are how this crate creates, reads, and deletes
+/// files: overlay2 cache, stage rootfs, `COPY` / `ADD`, unpack, and export.
+/// Image configs and layer blobs use the methods below (defaults write Docker's
+/// data-root layout under [`Self::root`]).
 ///
-/// Instruction snapshots still use the overlay2 cache under [`Self::root`];
-/// that path must be a writable host directory because `RUN` / `COPY` operate
-/// on real files. Only image blobs and metadata go through these methods.
-pub trait ImageStore: Send + Sync {
+/// [`LocalImageStore`] is the default. Implement [`FileSystem`] plus
+/// [`Self::root`] to redirect every file operation.
+pub trait ImageStore: FileSystem {
     /// Host directory for overlay2 instruction cache and temporary build work.
     fn root(&self) -> &Path;
 
@@ -73,7 +74,7 @@ pub trait ImageStore: Send + Sync {
         config: &ConfigFile,
         layer_path: &Path,
     ) -> Result<(), Error> {
-        let data = fs::read(layer_path)?;
+        let data = self.read(layer_path)?;
         self.put_image(
             reference,
             platform,
@@ -171,7 +172,7 @@ pub struct StoredLayer {
     pub data: Vec<u8>,
 }
 
-/// Filesystem image store using Docker's data-root layout.
+/// overlay2 cache, work dirs, and image blobs through [`FileSystem`].
 ///
 /// ```text
 /// <root>/
@@ -179,7 +180,7 @@ pub struct StoredLayer {
 ///     config.json
 ///     digest
 ///     layers/
-///   overlay2/  # instruction cache (not part of this trait)
+///   overlay2/  # instruction cache
 ///   work/      # temporary build directories
 /// ```
 #[derive(Debug, Clone)]
@@ -235,19 +236,19 @@ impl Default for LocalImageStore {
     }
 }
 
+impl_filesystem_via_localfs!(LocalImageStore);
+
 impl ImageStore for LocalImageStore {
     fn root(&self) -> &Path {
         &self.root
     }
 
     fn is_cached(&self, reference: &Reference, platform: &Platform) -> bool {
-        self.image_dir(reference, platform)
-            .join("config.json")
-            .is_file()
+        self.is_file(&self.image_dir(reference, platform).join("config.json"))
     }
 
     fn image_digest(&self, reference: &Reference, platform: &Platform) -> Option<String> {
-        fs::read_to_string(self.image_dir(reference, platform).join("digest"))
+        self.read_to_string(&self.image_dir(reference, platform).join("digest"))
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -259,13 +260,13 @@ impl ImageStore for LocalImageStore {
         platform: &Platform,
     ) -> Result<ConfigFile, Error> {
         let path = self.image_dir(reference, platform).join("config.json");
-        let data = fs::read_to_string(&path).map_err(|e| Error::io(&path, e))?;
+        let data = self.read_to_string(&path)?;
         serde_json::from_str(&data).map_err(|e| Error::other(format!("cached image config: {e}")))
     }
 
     fn layer_digests(&self, reference: &Reference, platform: &Platform) -> Vec<String> {
         let path = self.layers_dir(reference, platform).join("digests");
-        let Ok(text) = fs::read_to_string(path) else {
+        let Ok(text) = self.read_to_string(&path) else {
             return Vec::new();
         };
         text.lines()
@@ -277,21 +278,17 @@ impl ImageStore for LocalImageStore {
 
     fn layer_count(&self, reference: &Reference, platform: &Platform) -> usize {
         let dir = self.layers_dir(reference, platform);
-        let Ok(entries) = fs::read_dir(&dir) else {
+        let Ok(entries) = self.read_dir(&dir) else {
             return 0;
         };
         entries
-            .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.ends_with(".tar.gz"))
-            })
+            .iter()
+            .filter(|e| e.name.to_str().is_some_and(|n| n.ends_with(".tar.gz")))
             .count()
     }
 
     fn has_layer(&self, reference: &Reference, platform: &Platform, index: usize) -> bool {
-        self.layer_path(reference, platform, index).is_file()
+        self.is_file(&self.layer_path(reference, platform, index))
     }
 
     fn read_layer(
@@ -300,12 +297,11 @@ impl ImageStore for LocalImageStore {
         platform: &Platform,
         index: usize,
     ) -> Result<Vec<u8>, Error> {
-        let path = self.layer_path(reference, platform, index);
-        fs::read(&path).map_err(|e| Error::io(&path, e))
+        self.read(&self.layer_path(reference, platform, index))
     }
 
     fn layer_size(&self, reference: &Reference, platform: &Platform, index: usize) -> u64 {
-        fs::metadata(self.layer_path(reference, platform, index))
+        self.metadata(&self.layer_path(reference, platform, index))
             .map(|m| m.len())
             .unwrap_or(0)
     }
@@ -317,33 +313,36 @@ impl ImageStore for LocalImageStore {
         image: StoredImage,
     ) -> Result<(), Error> {
         let dir = self.image_dir(reference, platform);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
+        if self.exists(&dir) {
+            self.remove_dir_all(&dir)?;
         }
         let layers_dir = dir.join("layers");
-        fs::create_dir_all(&layers_dir)?;
+        self.create_dir_all(&layers_dir)?;
         let mut digest_lines = Vec::new();
         let mut all_digests = true;
         for (index, layer) in image.layers.iter().enumerate() {
-            fs::write(layers_dir.join(format!("{index}.tar.gz")), &layer.data)?;
+            self.write(&layers_dir.join(format!("{index}.tar.gz")), &layer.data)?;
             match &layer.digest {
                 Some(d) => digest_lines.push(d.clone()),
                 None => all_digests = false,
             }
         }
         if all_digests && !digest_lines.is_empty() {
-            fs::write(layers_dir.join("digests"), digest_lines.join("\n") + "\n")?;
+            self.write(
+                &layers_dir.join("digests"),
+                (digest_lines.join("\n") + "\n").as_bytes(),
+            )?;
         }
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_string_pretty(&image.config)?,
+        self.write(
+            &dir.join("config.json"),
+            serde_json::to_string_pretty(&image.config)?.as_bytes(),
         )?;
-        fs::write(
-            dir.join("platform"),
-            format!("{}/{}", platform.os, platform.architecture),
+        self.write(
+            &dir.join("platform"),
+            format!("{}/{}", platform.os, platform.architecture).as_bytes(),
         )?;
         if let Some(digest) = image.digest.filter(|d| !d.is_empty()) {
-            fs::write(dir.join("digest"), digest)?;
+            self.write(&dir.join("digest"), digest.as_bytes())?;
         }
         Ok(())
     }
@@ -357,22 +356,25 @@ impl ImageStore for LocalImageStore {
         layer_path: &Path,
     ) -> Result<(), Error> {
         let dir = self.image_dir(reference, platform);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
+        if self.exists(&dir) {
+            self.remove_dir_all(&dir)?;
         }
         let layers_dir = dir.join("layers");
-        fs::create_dir_all(&layers_dir)?;
-        fs::copy(layer_path, layers_dir.join("0.tar.gz"))?;
-        fs::write(layers_dir.join("digests"), format!("{digest}\n"))?;
-        fs::write(
-            dir.join("config.json"),
-            serde_json::to_string_pretty(config)?,
+        self.create_dir_all(&layers_dir)?;
+        self.copy(layer_path, &layers_dir.join("0.tar.gz"))?;
+        self.write(
+            &layers_dir.join("digests"),
+            format!("{digest}\n").as_bytes(),
         )?;
-        fs::write(
-            dir.join("platform"),
-            format!("{}/{}", platform.os, platform.architecture),
+        self.write(
+            &dir.join("config.json"),
+            serde_json::to_string_pretty(config)?.as_bytes(),
         )?;
-        fs::write(dir.join("digest"), digest)?;
+        self.write(
+            &dir.join("platform"),
+            format!("{}/{}", platform.os, platform.architecture).as_bytes(),
+        )?;
+        self.write(&dir.join("digest"), digest.as_bytes())?;
         Ok(())
     }
 }

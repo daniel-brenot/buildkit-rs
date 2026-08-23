@@ -1,6 +1,5 @@
 //! Expand cached layers into a root filesystem directory.
 
-use std::fs;
 use std::path::Path;
 
 use oci_distribution::config::ConfigFile;
@@ -59,16 +58,16 @@ pub fn materialize_rootfs_with_progress<S: ImageStore>(
 
     let stamp = store.content_stamp(reference, platform)?;
     let stamp_path = dest.join(ROOTFS_STAMP);
-    let existing_stamp = fs::read_to_string(&stamp_path).unwrap_or_default();
-    if dest.is_dir() && stamp_path.is_file() && existing_stamp.trim() == stamp.trim() {
+    let existing_stamp = store.read_to_string(&stamp_path).unwrap_or_default();
+    if store.is_dir(dest) && store.is_file(&stamp_path) && existing_stamp.trim() == stamp.trim() {
         tracing::debug!(rootfs = %dest.display(), "reusing materialized rootfs");
         return Ok(());
     }
 
-    if dest.exists() {
-        fs::remove_dir_all(dest)?;
+    if store.exists(dest) {
+        store.remove_dir_all(dest)?;
     }
-    fs::create_dir_all(dest)?;
+    store.create_dir_all(dest)?;
 
     let n = store.layer_count(reference, platform);
     let digests = store.layer_digests(reference, platform);
@@ -96,7 +95,7 @@ pub fn materialize_rootfs_with_progress<S: ImageStore>(
         }
         tracing::debug!(layer = index, "unpacking layer");
         let data = store.read_layer(reference, platform, index)?;
-        apply_layer(dest, &data)
+        apply_layer(store, dest, &data)
             .map_err(|e| Error::other(format!("failed to unpack layer {index}: {e}")))?;
         if report_extract {
             progress.event(PullEvent::LayerProgress {
@@ -112,10 +111,10 @@ pub fn materialize_rootfs_with_progress<S: ImageStore>(
         }
     }
 
-    crate::unpack::finalize_rootfs(dest)
+    crate::unpack::finalize_rootfs(store, dest)
         .map_err(|e| Error::other(format!("failed to finalize rootfs links: {e}")))?;
 
-    fs::write(&stamp_path, stamp)?;
+    store.write(&stamp_path, stamp.as_bytes())?;
     Ok(())
 }
 

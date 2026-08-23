@@ -8,7 +8,7 @@ This crate pulls base images, applies Dockerfile instructions, and writes the re
 
 - Multi-stage Dockerfiles, including `COPY --from`
 - Local overlay2 layer cache
-- Pluggable [`ImageStore`](src/store.rs) for configs and layer blobs
+- Pluggable [`FileSystem`](src/fs.rs) / [`ImageStore`](src/store.rs) for every file operation
 - `.dockerignore` filtering
 - Registry pulls with Docker-style progress events
 - Registry auth from `~/.docker/config.json` or environment variables
@@ -137,7 +137,7 @@ Then call `kit.build_with_progress(request, &mut Printer).await`.
 
 ### Image store
 
-Pulled and exported blobs are stored through `ImageStore`. `Buildkit::new` uses the platform-default Docker data-root (`LocalImageStore::default`). Pass `LocalImageStore::new` for another directory, or implement `ImageStore` to control how configs and layer blobs are written.
+Every file create, read, and delete during a build goes through `FileSystem`, which `ImageStore` extends. `Buildkit::new` uses `LocalImageStore` (host `std::fs` under Docker's data-root). Implement `FileSystem` to control how files are written; blob layout defaults live on `ImageStore`.
 
 ```rust
 use buildkit::{Buildkit, ImageStore, LocalImageStore, NoopBackend};
@@ -155,8 +155,6 @@ fn with_local_dir() -> Result<(), buildkit::Error> {
     Ok(())
 }
 ```
-
-Overlay2 instruction snapshots still live under `ImageStore::root()` (a writable host path), because `RUN` and `COPY` need real files.
 
 ### Registry authentication
 

@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::context::BuildContext;
 use crate::expand;
 use crate::export::ImageMeta;
+use crate::fs::FileSystem;
 use crate::fsutil::join_workdir;
 use crate::platform::Platform;
 use crate::reference::parse_reference;
@@ -38,9 +39,9 @@ pub struct LayerCache {
 
 impl LayerCache {
     /// Open the overlay2 cache under `data_root`.
-    pub fn open(data_root: &Path) -> Result<Self, Error> {
+    pub fn open<F: FileSystem>(fs: &F, data_root: &Path) -> Result<Self, Error> {
         Ok(Self {
-            overlay: Overlay2::open(data_root)?,
+            overlay: Overlay2::open(fs, data_root)?,
         })
     }
 
@@ -50,18 +51,22 @@ impl LayerCache {
     }
 
     /// Whether a complete cache entry exists for chain id `id`.
-    pub fn has(&self, id: &str) -> bool {
-        self.overlay.has_id(id)
+    pub fn has<F: FileSystem>(&self, fs: &F, id: &str) -> bool {
+        self.overlay.has_id(fs, id)
     }
 
     /// Load image config and build-arg state for chain id `id` (no filesystem copy).
-    pub fn load_meta(&self, id: &str) -> Result<(ImageMeta, HashMap<String, String>), Error> {
-        self.overlay.load_meta_id(id)
+    pub fn load_meta<F: FileSystem>(
+        &self,
+        fs: &F,
+        id: &str,
+    ) -> Result<(ImageMeta, HashMap<String, String>), Error> {
+        self.overlay.load_meta_id(fs, id)
     }
 
     /// Path to the materialized rootfs for `id`.
-    pub fn resolve_rootfs(&self, id: &str) -> Result<PathBuf, Error> {
-        self.overlay.resolve_id(id)
+    pub fn resolve_rootfs<F: FileSystem>(&self, fs: &F, id: &str) -> Result<PathBuf, Error> {
+        self.overlay.resolve_id(fs, id)
     }
 
     /// Path to a packed layer blob if stored as a file.
@@ -70,23 +75,28 @@ impl LayerCache {
     }
 
     /// Whether a packed layer blob exists for this chain id.
-    pub fn has_layer_blob(&self, id: &str) -> bool {
-        self.overlay.has_layer_blob(id)
+    pub fn has_layer_blob<F: FileSystem>(&self, fs: &F, id: &str) -> bool {
+        self.overlay.has_layer_blob(fs, id)
     }
 
     /// Read the packed export blob for `id`.
-    pub fn read_layer_blob(&self, id: &str) -> Result<Vec<u8>, Error> {
-        self.overlay.read_layer_blob(id)
+    pub fn read_layer_blob<F: FileSystem>(&self, fs: &F, id: &str) -> Result<Vec<u8>, Error> {
+        self.overlay.read_layer_blob(fs, id)
     }
 
     /// Digest label stored for the packed blob (`sha256:…`).
-    pub fn layer_blob_digest(&self, id: &str) -> Result<String, Error> {
-        self.overlay.layer_blob_digest(id)
+    pub fn layer_blob_digest<F: FileSystem>(&self, fs: &F, id: &str) -> Result<String, Error> {
+        self.overlay.layer_blob_digest(fs, id)
     }
 
     /// Store a packed export blob for `id`.
-    pub fn write_layer_blob(&self, id: &str, bytes: &[u8]) -> Result<(), Error> {
-        self.overlay.write_layer_blob(id, bytes)
+    pub fn write_layer_blob<F: FileSystem>(
+        &self,
+        fs: &F,
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.overlay.write_layer_blob(fs, id, bytes)
     }
 
     /// Persist the current stage state under chain id `id`.
@@ -94,8 +104,9 @@ impl LayerCache {
     /// When `filesystem_changed` is false, the new layer has an empty `diff/`
     /// and reuses the parent's lower chain. When true, `rootfs` is stored as an
     /// overlay2 changeset against the parent.
-    pub fn save(
+    pub fn save<F: FileSystem>(
         &self,
+        fs: &F,
         id: &str,
         parent: &str,
         instruction: &str,
@@ -105,6 +116,7 @@ impl LayerCache {
         filesystem_changed: bool,
     ) -> Result<(), Error> {
         self.overlay.save_layer(
+            fs,
             id,
             parent,
             instruction,
@@ -116,8 +128,8 @@ impl LayerCache {
     }
 
     /// Remove all cached layers.
-    pub fn clear(&self) -> Result<(), Error> {
-        self.overlay.clear_all()
+    pub fn clear<F: FileSystem>(&self, fs: &F) -> Result<(), Error> {
+        self.overlay.clear_all(fs)
     }
 }
 
@@ -157,7 +169,8 @@ fn parse_reference_digest<S: ImageStore>(store: &S, base: &str, platform: &Platf
 }
 
 /// Build the cache key for one instruction (expanded, content-aware for COPY/ADD).
-pub fn instruction_cache_key(
+pub fn instruction_cache_key<F: FileSystem>(
+    fs: &F,
     inst: &Instruction,
     meta: &ImageMeta,
     args: &HashMap<String, String>,
@@ -203,11 +216,11 @@ pub fn instruction_cache_key(
                         } else {
                             crate::fsutil::guest_to_host(root, &join_workdir(wd, &src))
                         };
-                        hash_path(&host)?
+                        hash_path(fs, &host)?
                     }
                     None => {
-                        let host = context.resolve(&src)?;
-                        hash_path(&host)?
+                        let host = context.resolve(fs, &src)?;
+                        hash_path(fs, &host)?
                     }
                 };
                 parts.push(format!("{src}#{hash}"));
@@ -226,8 +239,8 @@ pub fn instruction_cache_key(
                 let hash = if is_remote_url(&src) {
                     format!("url:{src}")
                 } else {
-                    let host = context.resolve(&src)?;
-                    hash_path(&host)?
+                    let host = context.resolve(fs, &src)?;
+                    hash_path(fs, &host)?
                 };
                 parts.push(format!("{src}#{hash}"));
             }
@@ -319,26 +332,30 @@ fn is_remote_url(src: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-fn hash_path(path: &Path) -> Result<String, Error> {
+fn hash_path<F: FileSystem>(fs: &F, path: &Path) -> Result<String, Error> {
     let mut hasher = Sha256::new();
-    if path.is_dir() {
-        hash_dir(path, path, &mut hasher)?;
-    } else if path.is_file() {
-        hash_file(path, &mut hasher)?;
+    if fs.is_dir(path) {
+        hash_dir(fs, path, path, &mut hasher)?;
+    } else if fs.is_file(path) {
+        hash_file(fs, path, &mut hasher)?;
     } else {
         hasher.update(b"missing");
     }
     Ok(crate::export::hex_encode(hasher.finalize()))
 }
 
-fn hash_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<(), Error> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| Error::other(format!("cache hash {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
+fn hash_dir<F: FileSystem>(
+    fs: &F,
+    root: &Path,
+    dir: &Path,
+    hasher: &mut Sha256,
+) -> Result<(), Error> {
+    let mut entries = fs
+        .read_dir(dir)
+        .map_err(|e| Error::other(format!("cache hash {}: {e}", dir.display())))?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     for ent in entries {
-        let path = ent.path();
+        let path = ent.path;
         let rel = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -346,17 +363,18 @@ fn hash_dir(root: &Path, dir: &Path, hasher: &mut Sha256) -> Result<(), Error> {
             .replace('\\', "/");
         hasher.update(rel.as_bytes());
         hasher.update(&[0]);
-        if path.is_dir() {
-            hash_dir(root, &path, hasher)?;
-        } else if path.is_file() {
-            hash_file(&path, hasher)?;
+        if fs.is_dir(&path) {
+            hash_dir(fs, root, &path, hasher)?;
+        } else if fs.is_file(&path) {
+            hash_file(fs, &path, hasher)?;
         }
     }
     Ok(())
 }
 
-fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<(), Error> {
-    let mut file = std::fs::File::open(path)
+fn hash_file<F: FileSystem>(fs: &F, path: &Path, hasher: &mut Sha256) -> Result<(), Error> {
+    let mut file = fs
+        .open_file(path)
         .map_err(|e| Error::other(format!("cache hash {}: {e}", path.display())))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -386,8 +404,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let cache = LayerCache::open(&root).unwrap();
-        assert!(!cache.has("abc"));
+        let fs = crate::fs::LocalFs;
+        let cache = LayerCache::open(&fs, &root).unwrap();
+        assert!(!cache.has(&fs, "abc"));
 
         let rootfs = root.join("stage-rootfs");
         std::fs::create_dir_all(&rootfs).unwrap();
@@ -395,6 +414,7 @@ mod tests {
 
         cache
             .save(
+                &fs,
                 "abc",
                 "",
                 "FROM scratch",
@@ -404,9 +424,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert!(cache.has("abc"));
+        assert!(cache.has(&fs, "abc"));
         assert!(cache
-            .resolve_rootfs("abc")
+            .resolve_rootfs(&fs, "abc")
             .unwrap()
             .join("hello.txt")
             .is_file());
@@ -417,6 +437,7 @@ mod tests {
         std::fs::write(child_root.join("extra.txt"), b"x").unwrap();
         cache
             .save(
+                &fs,
                 "def",
                 "abc",
                 "COPY extra.txt /",
@@ -426,7 +447,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        let merged = cache.resolve_rootfs("def").unwrap();
+        let merged = cache.resolve_rootfs(&fs, "def").unwrap();
         assert!(merged.join("hello.txt").is_file());
         assert!(merged.join("extra.txt").is_file());
         let child_diff = root.join("overlay2").join("def").join("diff");

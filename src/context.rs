@@ -1,8 +1,8 @@
 //! Local build context and basic `.dockerignore` filtering.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::fs::FileSystem;
 use crate::Error;
 
 #[derive(Debug, Clone)]
@@ -18,15 +18,15 @@ struct IgnoreRule {
 }
 
 impl BuildContext {
-    pub fn open(root: impl Into<PathBuf>) -> Result<Self, Error> {
+    pub fn open<F: FileSystem>(fs: &F, root: impl Into<PathBuf>) -> Result<Self, Error> {
         let root = root.into();
-        if !root.is_dir() {
+        if !fs.is_dir(&root) {
             return Err(Error::other(format!(
                 "build context is not a directory: {}",
                 root.display()
             )));
         }
-        let ignore = load_dockerignore(&root)?;
+        let ignore = load_dockerignore(fs, &root)?;
         Ok(BuildContext { root, ignore })
     }
 
@@ -34,20 +34,19 @@ impl BuildContext {
         &self.root
     }
 
-    pub fn resolve(&self, rel: &str) -> Result<PathBuf, Error> {
+    pub fn resolve<F: FileSystem>(&self, fs: &F, rel: &str) -> Result<PathBuf, Error> {
         let rel = rel.trim_start_matches("./");
         let path = if rel == "." || rel.is_empty() {
             self.root.clone()
         } else {
             self.root.join(rel)
         };
-        let canon_root = self
-            .root
-            .canonicalize()
+        let canon_root = fs
+            .canonicalize(&self.root)
             .map_err(|e| Error::other(format!("context: {e}")))?;
-        if path.exists() {
-            let canon = path
-                .canonicalize()
+        if fs.exists(&path) {
+            let canon = fs
+                .canonicalize(&path)
                 .map_err(|e| Error::other(format!("context path '{}': {e}", path.display())))?;
             if !canon.starts_with(&canon_root) {
                 return Err(Error::other(format!(
@@ -77,12 +76,12 @@ impl BuildContext {
     }
 }
 
-fn load_dockerignore(root: &Path) -> Result<Vec<IgnoreRule>, Error> {
+fn load_dockerignore<F: FileSystem>(fs: &F, root: &Path) -> Result<Vec<IgnoreRule>, Error> {
     let path = root.join(".dockerignore");
-    if !path.is_file() {
+    if !fs.is_file(&path) {
         return Ok(default_ignore());
     }
-    let data = fs::read_to_string(&path)?;
+    let data = fs.read_to_string(&path)?;
     let mut rules = default_ignore();
     for line in data.lines() {
         let line = line.trim();
@@ -142,47 +141,51 @@ fn match_pattern(pattern: &str, path: &str) -> bool {
 
 /// Recursively copy `src` (file or directory) into `dest`, honoring
 /// `.dockerignore` when `src` is under the context.
-pub fn copy_into(context: &BuildContext, src: &Path, dest: &Path) -> Result<(), Error> {
-    if src.is_file() {
+pub fn copy_into<F: FileSystem>(
+    fs: &F,
+    context: &BuildContext,
+    src: &Path,
+    dest: &Path,
+) -> Result<(), Error> {
+    if fs.is_file(src) {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs.create_dir_all(parent)?;
         }
-        fs::copy(src, dest).map_err(|e| {
+        fs.copy(src, dest).map_err(|e| {
             Error::other(format!("copy {} -> {}: {e}", src.display(), dest.display()))
         })?;
         return Ok(());
     }
-    if !src.is_dir() {
+    if !fs.is_dir(src) {
         return Err(Error::other(format!(
             "COPY source not found: {}",
             src.display()
         )));
     }
-    fs::create_dir_all(dest)?;
-    copy_dir(context, src, dest, src)?;
+    fs.create_dir_all(dest)?;
+    copy_dir(fs, context, src, dest, src)?;
     Ok(())
 }
 
-fn copy_dir(
+fn copy_dir<F: FileSystem>(
+    fs: &F,
     context: &BuildContext,
     src_dir: &Path,
     dest_dir: &Path,
     walk_root: &Path,
 ) -> Result<(), Error> {
-    for entry in fs::read_dir(src_dir)? {
-        let entry = entry?;
-        let path = entry.path();
+    for entry in fs.read_dir(src_dir)? {
+        let path = entry.path;
         let rel = path.strip_prefix(walk_root).unwrap_or(path.as_path());
         if context.is_ignored(rel) {
             continue;
         }
-        let dest = dest_dir.join(entry.file_name());
-        let ft = entry.file_type()?;
-        if ft.is_dir() {
-            fs::create_dir_all(&dest)?;
-            copy_dir(context, &path, &dest, walk_root)?;
-        } else if ft.is_file() {
-            fs::copy(&path, &dest).map_err(|e| {
+        let dest = dest_dir.join(&entry.name);
+        if entry.is_dir {
+            fs.create_dir_all(&dest)?;
+            copy_dir(fs, context, &path, &dest, walk_root)?;
+        } else if entry.is_file {
+            fs.copy(&path, &dest).map_err(|e| {
                 Error::other(format!(
                     "copy {} -> {}: {e}",
                     path.display(),

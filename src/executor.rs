@@ -1,7 +1,6 @@
 //! Execute a parsed Dockerfile against a local context.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +12,8 @@ use crate::cache::{self, LayerCache};
 use crate::context::{copy_into, BuildContext};
 use crate::expand;
 use crate::export::{self, ImageMeta};
-use crate::fsutil::{copy_tree, guest_to_host, join_workdir};
+use crate::fs::copy_tree;
+use crate::fsutil::{guest_to_host, join_workdir};
 use crate::materialize::materialize_rootfs;
 use crate::platform::default_pull_platform;
 use crate::platform::Platform;
@@ -50,17 +50,17 @@ pub async fn build<B: Backend, S: ImageStore>(
 
     let t0 = Instant::now();
     let id_df = progress.start("[internal] load build definition from Dockerfile");
-    let context = BuildContext::open(&request.context)?;
+    let context = BuildContext::open(kit.store(), &request.context)?;
     let dockerfile_path = if request.dockerfile.is_absolute() {
         request.dockerfile.clone()
     } else {
         context.root().join(&request.dockerfile)
     };
-    let df = fs::read_to_string(&dockerfile_path).map_err(|e| {
-        Error::io(
-            dockerfile_path.clone(),
-            std::io::Error::new(e.kind(), format!("failed to read Dockerfile: {e}")),
-        )
+    let df = kit.store().read_to_string(&dockerfile_path).map_err(|e| {
+        Error::other(format!(
+            "failed to read Dockerfile {}: {e}",
+            dockerfile_path.display()
+        ))
     })?;
     progress.status(id_df, format!("transferring dockerfile: {}B", df.len()));
     progress.done(id_df, t0.elapsed());
@@ -95,7 +95,7 @@ pub async fn build<B: Backend, S: ImageStore>(
             .unwrap_or(0)
     );
     let work = export::work_dir(kit.work_root(), &build_id);
-    fs::create_dir_all(&work)?;
+    kit.store().create_dir_all(&work)?;
 
     let mut completed: HashMap<String, StageState> = HashMap::new();
     let mut last_state: Option<StageState> = None;
@@ -103,7 +103,7 @@ pub async fn build<B: Backend, S: ImageStore>(
     for (idx, stage) in stages.iter().enumerate() {
         let stage_dir = work.join(format!("stage-{idx}"));
         let rootfs = stage_dir.join("rootfs");
-        fs::create_dir_all(&rootfs)?;
+        kit.store().create_dir_all(&rootfs)?;
 
         let base = expand::expand(&stage.image.as_str(), &global_args);
         let base_as_scratch = base.eq_ignore_ascii_case("scratch");
@@ -137,11 +137,11 @@ pub async fn build<B: Backend, S: ImageStore>(
         let mut cache_busted = request.no_cache;
 
         let mut state = {
-            let try_cache = !cache_busted && kit.cache().has(&from_id);
+            let try_cache = !cache_busted && kit.cache().has(kit.store(), &from_id);
             let loaded = if try_cache {
                 match (
-                    kit.cache().load_meta(&from_id),
-                    kit.cache().resolve_rootfs(&from_id),
+                    kit.cache().load_meta(kit.store(), &from_id),
+                    kit.cache().resolve_rootfs(kit.store(), &from_id),
                 ) {
                     (Ok((meta, args)), Ok(snap)) => {
                         progress.cached(id_from, std::time::Duration::ZERO);
@@ -192,9 +192,16 @@ pub async fn build<B: Backend, S: ImageStore>(
                     Ok(mut s) => {
                         s.work_rootfs = rootfs.clone();
                         s.layer_id = from_id.clone();
-                        let _ = kit
-                            .cache()
-                            .save(&from_id, "", &from_key, &s.meta, &s.args, &s.rootfs, true);
+                        let _ = kit.cache().save(
+                            kit.store(),
+                            &from_id,
+                            "",
+                            &from_key,
+                            &s.meta,
+                            &s.args,
+                            &s.rootfs,
+                            true,
+                        );
                         progress.done(id_from, t0.elapsed());
                         parent_id = from_id.clone();
                         s
@@ -221,6 +228,7 @@ pub async fn build<B: Backend, S: ImageStore>(
                 .map(|(k, v)| (k.clone(), (v.rootfs.clone(), v.meta.working_dir.clone())))
                 .collect();
             let (ikey, fs_changed) = match cache::instruction_cache_key(
+                kit.store(),
                 inst,
                 &state.meta,
                 &state.args,
@@ -236,10 +244,10 @@ pub async fn build<B: Backend, S: ImageStore>(
             };
             let layer_id = cache::chain_id(&parent_id, &ikey);
 
-            if !cache_busted && kit.cache().has(&layer_id) {
+            if !cache_busted && kit.cache().has(kit.store(), &layer_id) {
                 match (
-                    kit.cache().load_meta(&layer_id),
-                    kit.cache().resolve_rootfs(&layer_id),
+                    kit.cache().load_meta(kit.store(), &layer_id),
+                    kit.cache().resolve_rootfs(kit.store(), &layer_id),
                 ) {
                     (Ok((meta, args)), Ok(snap)) => {
                         state.meta = meta;
@@ -258,7 +266,7 @@ pub async fn build<B: Backend, S: ImageStore>(
             }
 
             if instruction_needs_writable(inst) {
-                if let Err(e) = prepare_writable(&mut state) {
+                if let Err(e) = prepare_writable(kit.store(), &mut state) {
                     progress.error(id, e.to_string(), t0.elapsed());
                     return Err(e);
                 }
@@ -281,6 +289,7 @@ pub async fn build<B: Backend, S: ImageStore>(
                 return Err(e);
             }
             let _ = kit.cache().save(
+                kit.store(),
                 &layer_id,
                 &parent_id,
                 &ikey,
@@ -322,7 +331,7 @@ pub async fn build<B: Backend, S: ImageStore>(
     )?;
     progress.done(id_export, t0.elapsed());
 
-    let _ = fs::remove_dir_all(&work);
+    let _ = kit.store().remove_dir_all(&work);
 
     let image_ids: Vec<String> = refs.iter().map(|r| r.to_string()).collect();
     progress.emit(BuildEvent::Finished {
@@ -342,9 +351,9 @@ fn export_final<S: ImageStore>(
     id_export: u32,
     t0: Instant,
 ) -> Result<Vec<oci_distribution::Reference>, Error> {
-    if cache.has_layer_blob(&final_state.layer_id) {
+    if cache.has_layer_blob(store, &final_state.layer_id) {
         if let Some(blob_path) = cache.layer_blob_path(&final_state.layer_id) {
-            let digest = match cache.layer_blob_digest(&final_state.layer_id) {
+            let digest = match cache.layer_blob_digest(store, &final_state.layer_id) {
                 Ok(d) => d,
                 Err(e) => {
                     progress.error(id_export, e.to_string(), t0.elapsed());
@@ -368,7 +377,7 @@ fn export_final<S: ImageStore>(
                 }
             }
         } else {
-            let layer = match cache.read_layer_blob(&final_state.layer_id) {
+            let layer = match cache.read_layer_blob(store, &final_state.layer_id) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     progress.error(id_export, e.to_string(), t0.elapsed());
@@ -393,9 +402,9 @@ fn export_final<S: ImageStore>(
         }
     } else {
         progress.status(id_export, "exporting layers");
-        let layer = match export::pack_rootfs(&final_state.rootfs) {
+        let layer = match export::pack_rootfs(store, &final_state.rootfs) {
             Ok(bytes) => {
-                let _ = cache.write_layer_blob(&final_state.layer_id, &bytes);
+                let _ = cache.write_layer_blob(store, &final_state.layer_id, &bytes);
                 bytes
             }
             Err(e) => {
@@ -564,12 +573,12 @@ fn init_stage_from_image<S: ImageStore>(
 
     if !base_as_scratch {
         let bundle = stage_dir.join("base-rootfs");
-        if bundle.is_dir() {
-            if rootfs.exists() {
-                let _ = fs::remove_dir_all(rootfs);
+        if store.is_dir(&bundle) {
+            if store.exists(rootfs) {
+                let _ = store.remove_dir_all(rootfs);
             }
-            fs::create_dir_all(rootfs)?;
-            copy_tree(&bundle, rootfs)?;
+            store.create_dir_all(rootfs)?;
+            copy_tree(store, &bundle, rootfs)?;
         }
         if let Ok(reference) = parse_reference(base) {
             if let Ok(cfg) = store.image_config(&reference, platform) {
@@ -610,16 +619,16 @@ fn instruction_needs_writable(inst: &Instruction) -> bool {
     )
 }
 
-fn prepare_writable(state: &mut StageState) -> Result<(), Error> {
+fn prepare_writable<S: ImageStore>(store: &S, state: &mut StageState) -> Result<(), Error> {
     if !state.rootfs_shared {
         return Ok(());
     }
     let dest = state.work_rootfs.clone();
-    if dest.exists() {
-        fs::remove_dir_all(&dest)?;
+    if store.exists(&dest) {
+        store.remove_dir_all(&dest)?;
     }
-    fs::create_dir_all(&dest)?;
-    copy_tree(&state.rootfs, &dest)?;
+    store.create_dir_all(&dest)?;
+    copy_tree(store, &state.rootfs, &dest)?;
     state.rootfs = dest;
     state.rootfs_shared = false;
     Ok(())
@@ -668,7 +677,7 @@ async fn apply_instruction<B: Backend, S: ImageStore>(
             let abs = join_workdir(&state.meta.working_dir, &path);
             state.meta.working_dir = abs.clone();
             let host = guest_to_host(&state.rootfs, &abs);
-            fs::create_dir_all(&host)?;
+            kit.store().create_dir_all(&host)?;
         }
         Instruction::User(user) => {
             state.meta.user = Some(expand::expand(&user.spec, &merged_vars(state)));
@@ -715,15 +724,31 @@ async fn apply_instruction<B: Backend, S: ImageStore>(
                 .iter()
                 .find(|f| f.is("from"))
                 .and_then(|f| f.value.as_deref());
-            apply_copy(state, from, &copy.sources, &dest_guest, context, completed)?;
-            write_heredocs(state, &copy.heredocs, &dest_guest)?;
+            apply_copy(
+                kit.store(),
+                state,
+                from,
+                &copy.sources,
+                &dest_guest,
+                context,
+                completed,
+            )?;
+            write_heredocs(kit.store(), state, &copy.heredocs, &dest_guest)?;
         }
         Instruction::Add(add) => {
             let dest = expand::expand(&add.destination, &merged_vars(state));
             let dest_guest = join_workdir(&state.meta.working_dir, &dest);
             progress.status(vertex_id, format!("adding to {dest_guest}"));
-            apply_add(state, &add.sources, &dest_guest, context, completed).await?;
-            write_heredocs(state, &add.heredocs, &dest_guest)?;
+            apply_add(
+                kit.store(),
+                state,
+                &add.sources,
+                &dest_guest,
+                context,
+                completed,
+            )
+            .await?;
+            write_heredocs(kit.store(), state, &add.heredocs, &dest_guest)?;
         }
         Instruction::Run(run) => {
             let vars = merged_vars(state);
@@ -781,7 +806,8 @@ fn command_to_args(
     }
 }
 
-fn write_heredocs(
+fn write_heredocs<S: ImageStore>(
+    store: &S,
     state: &StageState,
     heredocs: &[dockerfile::Heredoc],
     dest_guest: &str,
@@ -790,25 +816,26 @@ fn write_heredocs(
         return Ok(());
     }
     let dest_host = guest_to_host(&state.rootfs, dest_guest);
-    if dest_guest.ends_with('/') || dest_host.is_dir() {
-        fs::create_dir_all(&dest_host)?;
+    if dest_guest.ends_with('/') || store.is_dir(&dest_host) {
+        store.create_dir_all(&dest_host)?;
         for h in heredocs {
-            fs::write(dest_host.join(&h.delimiter), &h.body)?;
+            store.write(&dest_host.join(&h.delimiter), h.body.as_bytes())?;
         }
     } else {
         if let Some(parent) = dest_host.parent() {
-            fs::create_dir_all(parent)?;
+            store.create_dir_all(parent)?;
         }
         let mut body = String::new();
         for h in heredocs {
             body.push_str(&h.body);
         }
-        fs::write(&dest_host, body)?;
+        store.write(&dest_host, body.as_bytes())?;
     }
     Ok(())
 }
 
-fn apply_copy(
+fn apply_copy<S: ImageStore>(
+    store: &S,
     state: &mut StageState,
     from: Option<&str>,
     sources: &[String],
@@ -830,18 +857,21 @@ fn apply_copy(
             } else {
                 guest_to_host(&donor.rootfs, &join_workdir(&donor.meta.working_dir, &src))
             };
-            let target = copy_dest_path(&dest_host, dest_is_dir, sources.len() > 1, &src_host)?;
-            copy_into(context, &src_host, &target)?;
+            let target =
+                copy_dest_path(store, &dest_host, dest_is_dir, sources.len() > 1, &src_host)?;
+            copy_into(store, context, &src_host, &target)?;
         } else {
-            let src_host = context.resolve(&src)?;
-            let target = copy_dest_path(&dest_host, dest_is_dir, sources.len() > 1, &src_host)?;
-            copy_into(context, &src_host, &target)?;
+            let src_host = context.resolve(store, &src)?;
+            let target =
+                copy_dest_path(store, &dest_host, dest_is_dir, sources.len() > 1, &src_host)?;
+            copy_into(store, context, &src_host, &target)?;
         }
     }
     Ok(())
 }
 
-async fn apply_add(
+async fn apply_add<S: ImageStore>(
+    store: &S,
     state: &mut StageState,
     sources: &[String],
     dest_guest: &str,
@@ -856,21 +886,25 @@ async fn apply_add(
     for src in sources {
         let src = expand::expand(src, &merged_vars(state));
         if is_remote_url(&src) {
-            if multi && !dest_is_dir && !dest_host.is_dir() {
+            if multi && !dest_is_dir && !store.is_dir(&dest_host) {
                 return Err(Error::other(
                     "when ADD has multiple sources, destination must be a directory",
                 ));
             }
-            let target =
-                url_dest_path(&dest_host, dest_is_dir || multi || dest_host.is_dir(), &src)?;
-            download_url(&src, &target).await?;
+            let target = url_dest_path(
+                store,
+                &dest_host,
+                dest_is_dir || multi || store.is_dir(&dest_host),
+                &src,
+            )?;
+            download_url(store, &src, &target).await?;
         } else {
             local.push(src);
         }
     }
 
     if !local.is_empty() {
-        apply_copy(state, None, &local, dest_guest, context, completed)?;
+        apply_copy(store, state, None, &local, dest_guest, context, completed)?;
     }
     Ok(())
 }
@@ -890,19 +924,24 @@ fn url_filename(url: &str) -> String {
     }
 }
 
-fn url_dest_path(dest_host: &Path, as_dir: bool, url: &str) -> Result<PathBuf, Error> {
+fn url_dest_path<S: ImageStore>(
+    store: &S,
+    dest_host: &Path,
+    as_dir: bool,
+    url: &str,
+) -> Result<PathBuf, Error> {
     if as_dir {
-        fs::create_dir_all(dest_host)?;
+        store.create_dir_all(dest_host)?;
         Ok(dest_host.join(url_filename(url)))
     } else {
         if let Some(parent) = dest_host.parent() {
-            fs::create_dir_all(parent)?;
+            store.create_dir_all(parent)?;
         }
         Ok(dest_host.to_path_buf())
     }
 }
 
-async fn download_url(url: &str, dest: &Path) -> Result<(), Error> {
+async fn download_url<S: ImageStore>(store: &S, url: &str, dest: &Path) -> Result<(), Error> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("buildkit/0.1")
@@ -924,28 +963,30 @@ async fn download_url(url: &str, dest: &Path) -> Result<(), Error> {
         .await
         .map_err(|e| Error::other(format!("ADD: failed to read '{url}': {e}")))?;
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        store.create_dir_all(parent)?;
     }
-    fs::write(dest, &bytes)
+    store
+        .write(dest, &bytes)
         .map_err(|e| Error::other(format!("ADD: failed to write '{}': {e}", dest.display())))?;
     Ok(())
 }
 
-fn copy_dest_path(
+fn copy_dest_path<S: ImageStore>(
+    store: &S,
     dest_host: &Path,
     dest_is_dir: bool,
     multi_src: bool,
     src_host: &Path,
 ) -> Result<PathBuf, Error> {
-    if dest_is_dir || multi_src || dest_host.is_dir() {
-        fs::create_dir_all(dest_host)?;
+    if dest_is_dir || multi_src || store.is_dir(dest_host) {
+        store.create_dir_all(dest_host)?;
         let name = src_host
             .file_name()
             .ok_or_else(|| Error::other("invalid COPY source"))?;
         Ok(dest_host.join(name))
     } else {
         if let Some(parent) = dest_host.parent() {
-            fs::create_dir_all(parent)?;
+            store.create_dir_all(parent)?;
         }
         Ok(dest_host.to_path_buf())
     }

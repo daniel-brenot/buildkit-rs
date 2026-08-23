@@ -1,12 +1,12 @@
 //! Build OCI images from Dockerfiles with a pluggable execution backend
-//! and image store.
+//! and filesystem.
 //!
 //! [`Buildkit`] pulls base images, applies Dockerfile instructions, and writes
-//! the result through an [`ImageStore`]. Everything except `RUN` and blob I/O
-//! is handled here: unpacking layers, `COPY` / `ADD`, metadata, overlay2 layer
-//! cache, and export. `RUN` is delegated to a [`Backend`] you provide so any
-//! runtime can execute build steps. Image configs and layer blobs go through
-//! [`ImageStore`]; the default is [`LocalImageStore`] (Docker data-root layout).
+//! the result through an [`ImageStore`]. Everything except `RUN` is handled
+//! here: unpacking layers, `COPY` / `ADD`, metadata, overlay2 layer cache, and
+//! export. `RUN` is delegated to a [`Backend`] you provide. Every create, read,
+//! and delete of files goes through [`FileSystem`] (a supertrait of
+//! [`ImageStore`]); the default is [`LocalImageStore`] / [`LocalFs`].
 //!
 //! # Quick start
 //!
@@ -52,14 +52,11 @@
 //!
 //! # Image store
 //!
-//! Pulled and exported blobs are stored through [`ImageStore`]. [`Buildkit::new`]
-//! uses [`LocalImageStore::default`] (Docker's data-root on this platform).
-//! Pass another directory with [`LocalImageStore::new`], or implement
-//! [`ImageStore`] and construct with [`Buildkit::with_image_store`].
-//!
-//! Overlay2 instruction snapshots still live under [`ImageStore::root`] — that
-//! path must be a writable host directory because `RUN` / `COPY` need real
-//! files. Only configs and layer blobs go through the trait.
+//! [`ImageStore`] extends [`FileSystem`]: overlay2 cache, stage rootfs, `COPY`,
+//! unpack, and export all call those methods instead of `std::fs`.
+//! [`Buildkit::new`] uses [`LocalImageStore::default`]. Pass another directory
+//! with [`LocalImageStore::new`], or implement [`FileSystem`] + [`ImageStore`]
+//! and construct with [`Buildkit::with_image_store`].
 //!
 //! # Pulling without a Dockerfile
 //!
@@ -102,6 +99,7 @@ mod error;
 mod executor;
 mod expand;
 mod export;
+mod fs;
 mod fsutil;
 mod materialize;
 mod platform;
@@ -124,6 +122,10 @@ pub use buildkit::Buildkit;
 pub use cache::LayerCache;
 pub use error::Error;
 pub use export::ImageMeta;
+pub use fs::FileSystem;
+pub use fs::FsDirEntry;
+pub use fs::FsMetadata;
+pub use fs::LocalFs;
 pub use materialize::materialize_rootfs;
 pub use materialize::materialize_rootfs_with_progress;
 pub use platform::default_pull_platform;
