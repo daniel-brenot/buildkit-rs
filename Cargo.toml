@@ -9,7 +9,7 @@ keywords = ["docker", "dockerfile", "buildkit", "oci", "containers"]
 categories = ["development-tools"]
 
 [dependencies]
-dockerfile = { git = "https://github.com/daniel-brenot/dockerfile-rs.git" }
+dockerfile = { git = "https://github.com/daniel-brenot/dockerfile-rs.git", version = "0.1.0" }
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 flate2 = "1"
