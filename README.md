@@ -8,7 +8,7 @@ This crate pulls base images, applies Dockerfile instructions, and writes the re
 
 - Multi-stage Dockerfiles, including `COPY --from`
 - Local overlay2 layer cache
-- Pluggable [`FileSystem`](src/fs.rs) / [`ImageStore`](src/store.rs) for every file operation
+- Pluggable [`FileSystem`](src/fs.rs) for every file operation
 - `.dockerignore` filtering
 - Registry pulls with Docker-style progress events
 - Registry auth from `~/.docker/config.json` or environment variables
@@ -99,10 +99,10 @@ impl Backend for MyRuntime {
 You can pull and materialize a rootfs without a full Dockerfile build:
 
 ```rust
-use buildkit::{default_pull_platform, ensure_rootfs, LocalImageStore};
+use buildkit::{default_pull_platform, ensure_rootfs, ImageStore};
 
 async fn pull_alpine() -> Result<(), buildkit::Error> {
-    let store = LocalImageStore::new("/var/lib/buildkit".into());
+    let store = ImageStore::new("/var/lib/buildkit".into());
     ensure_rootfs(
         &store,
         "alpine:3.19",
@@ -135,23 +135,28 @@ impl BuildProgress for Printer {
 
 Then call `kit.build_with_progress(request, &mut Printer).await`.
 
-### Image store
+### Filesystem
 
-Every file create, read, and delete during a build goes through `FileSystem`, which `ImageStore` extends. `Buildkit::new` uses `LocalImageStore` (host `std::fs` under Docker's data-root). Implement `FileSystem` to control how files are written; blob layout defaults live on `ImageStore`.
+Every file create, read, and delete during a build goes through `FileSystem`. `ImageStore` uses that implementation for image blobs and the overlay2 layout; the on-disk layout is not itself a plug-in. `Buildkit::new` uses `ImageStore::default` (host `std::fs` under Docker's data-root). Implement `FileSystem` to control how files are written.
 
 ```rust
-use buildkit::{Buildkit, ImageStore, LocalImageStore, NoopBackend};
+use buildkit::{Buildkit, FileSystem, ImageStore, LocalFs, NoopBackend};
 
-fn with_custom_store(store: impl ImageStore) -> Result<(), buildkit::Error> {
-    let _kit = Buildkit::with_image_store(NoopBackend, store)?;
+fn with_custom_fs(fs: impl FileSystem) -> Result<(), buildkit::Error> {
+    let _kit = Buildkit::with_fs(NoopBackend, fs, "/var/lib/buildkit")?;
     Ok(())
 }
 
 fn with_local_dir() -> Result<(), buildkit::Error> {
-    let _kit = Buildkit::with_image_store(
+    let _kit = Buildkit::with_store(
         NoopBackend,
-        LocalImageStore::new("/var/lib/buildkit".into()),
+        ImageStore::new("/var/lib/buildkit".into()),
     )?;
+    Ok(())
+}
+
+fn with_default_host_fs() -> Result<(), buildkit::Error> {
+    let _kit = Buildkit::with_fs(NoopBackend, LocalFs, "/var/lib/buildkit")?;
     Ok(())
 }
 ```
@@ -168,7 +173,7 @@ Override the config directory with `buildkit::set_config_dir`. Docker itself doe
 
 ## Store layout
 
-`LocalImageStore` keeps pulled images, layer cache, and scratch work under a single root:
+`ImageStore` keeps pulled images, layer cache, and scratch work under a single root:
 
 ```
 <store>/

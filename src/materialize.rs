@@ -5,6 +5,7 @@ use std::path::Path;
 use oci_distribution::config::ConfigFile;
 use oci_distribution::config::Os;
 
+use crate::fs::FileSystem;
 use crate::progress::{short_layer_id, NullProgress, PullEvent, PullProgress};
 use crate::store::ImageStore;
 use crate::unpack::apply_layer;
@@ -29,8 +30,8 @@ pub fn check_runnable_platform(config: &ConfigFile) -> Result<(), Error> {
 ///
 /// Reuses an existing materialization when the image content fingerprint still
 /// matches.
-pub fn materialize_rootfs<S: ImageStore>(
-    store: &S,
+pub fn materialize_rootfs<F: FileSystem>(
+    store: &ImageStore<F>,
     reference: &oci_distribution::Reference,
     platform: &crate::platform::Platform,
     dest: &Path,
@@ -39,8 +40,8 @@ pub fn materialize_rootfs<S: ImageStore>(
 }
 
 /// Like [`materialize_rootfs`], optionally emitting Docker-style extract progress.
-pub fn materialize_rootfs_with_progress<S: ImageStore>(
-    store: &S,
+pub fn materialize_rootfs_with_progress<F: FileSystem>(
+    store: &ImageStore<F>,
     reference: &oci_distribution::Reference,
     platform: &crate::platform::Platform,
     dest: &Path,

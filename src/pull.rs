@@ -1,4 +1,4 @@
-//! Pull images from OCI registries into a [`crate::ImageStore`].
+//! Pull images from OCI registries into an [`crate::ImageStore`].
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use oci_distribution::Client;
 use oci_distribution::Reference;
 
 use crate::auth::auth_for_reference;
+use crate::fs::FileSystem;
 use crate::platform::default_pull_platform;
 use crate::platform::platform_resolver;
 use crate::platform::Platform;
@@ -87,8 +88,8 @@ fn pulling_from_parts(reference: &Reference) -> (String, String) {
 ///
 /// Skips re-downloading layers when the local digest already matches the
 /// registry. Progress events are discarded; see [`pull_image_with_progress`].
-pub async fn pull_image<S: ImageStore>(
-    store: &S,
+pub async fn pull_image<F: FileSystem>(
+    store: &ImageStore<F>,
     reference: &Reference,
     platform: &Platform,
 ) -> Result<PulledImage, Error> {
@@ -99,8 +100,8 @@ pub async fn pull_image<S: ImageStore>(
 ///
 /// Does not emit the final `Digest` / `Status` lines — call
 /// [`finish_pull_progress`] after unpacking so ordering matches Docker.
-pub async fn pull_image_with_progress<S: ImageStore>(
-    store: &S,
+pub async fn pull_image_with_progress<F: FileSystem>(
+    store: &ImageStore<F>,
     reference: &Reference,
     platform: &Platform,
     progress: &mut dyn PullProgress,
@@ -270,8 +271,8 @@ pub fn finish_pull_progress(
 }
 
 /// Pull `image`, unpack its layers into `dest`, and return the resolved reference.
-pub async fn pull_and_materialize<S: ImageStore>(
-    store: &S,
+pub async fn pull_and_materialize<F: FileSystem>(
+    store: &ImageStore<F>,
     image: &str,
     dest: &Path,
     platform: &Platform,
@@ -283,8 +284,8 @@ pub async fn pull_and_materialize<S: ImageStore>(
 }
 
 /// Pull `reference` using [`crate::default_pull_platform`].
-pub async fn pull_image_default<S: ImageStore>(
-    store: &S,
+pub async fn pull_image_default<F: FileSystem>(
+    store: &ImageStore<F>,
     reference: &Reference,
 ) -> Result<PulledImage, Error> {
     pull_image(store, reference, &default_pull_platform()).await

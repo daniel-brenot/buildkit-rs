@@ -31,7 +31,8 @@ use overlay2::Overlay2;
 /// Docker overlay2 instruction-layer cache.
 ///
 /// Opened under `<data_root>/overlay2`. Not a swap point — image blobs go
-/// through [`ImageStore`]; this type only holds instruction snapshots.
+/// through [`ImageStore`] (via [`FileSystem`]); this type only holds instruction
+/// snapshots.
 #[derive(Debug, Clone)]
 pub struct LayerCache {
     overlay: Overlay2,
@@ -143,8 +144,8 @@ pub fn chain_id(parent: &str, instruction_key: &str) -> String {
 }
 
 /// Instruction-key prefix for a `FROM` line (includes base digest when known).
-pub fn from_cache_key<S: ImageStore>(
-    store: &S,
+pub fn from_cache_key<F: FileSystem>(
+    store: &ImageStore<F>,
     base: &str,
     scratch: bool,
     platform: &Platform,
@@ -159,7 +160,11 @@ pub fn from_cache_key<S: ImageStore>(
     )
 }
 
-fn parse_reference_digest<S: ImageStore>(store: &S, base: &str, platform: &Platform) -> String {
+fn parse_reference_digest<F: FileSystem>(
+    store: &ImageStore<F>,
+    base: &str,
+    platform: &Platform,
+) -> String {
     match parse_reference(base) {
         Ok(reference) => store
             .image_digest(&reference, platform)

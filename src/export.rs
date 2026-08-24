@@ -69,8 +69,8 @@ impl ImageMeta {
 
 /// Pack `rootfs` as a single gzip layer and write a cached image for each tag.
 #[allow(dead_code)]
-pub fn export_image<S: ImageStore>(
-    store: &S,
+pub fn export_image<F: FileSystem>(
+    store: &ImageStore<F>,
     rootfs: &Path,
     meta: &ImageMeta,
     tags: &[String],
@@ -82,8 +82,8 @@ pub fn export_image<S: ImageStore>(
 }
 
 /// Write tags from an already-packed layer blob (in-memory).
-pub fn export_image_layer<S: ImageStore>(
-    store: &S,
+pub fn export_image_layer<F: FileSystem>(
+    store: &ImageStore<F>,
     layer: &[u8],
     meta: &ImageMeta,
     tags: &[String],
@@ -104,8 +104,8 @@ pub fn export_image_layer<S: ImageStore>(
 }
 
 /// Write tags by copying a packed layer file (avoids loading large blobs into RAM).
-pub fn export_image_layer_file<S: ImageStore>(
-    store: &S,
+pub fn export_image_layer_file<F: FileSystem>(
+    store: &ImageStore<F>,
     layer_path: &Path,
     digest: &str,
     meta: &ImageMeta,
@@ -125,8 +125,8 @@ pub fn export_image_layer_file<S: ImageStore>(
     )
 }
 
-fn export_image_with_digest<S: ImageStore>(
-    store: &S,
+fn export_image_with_digest<F: FileSystem>(
+    store: &ImageStore<F>,
     layer_bytes: Option<&[u8]>,
     layer_path: Option<&Path>,
     digest: &str,

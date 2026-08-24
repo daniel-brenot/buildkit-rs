@@ -5,8 +5,8 @@
 //! the result through an [`ImageStore`]. Everything except `RUN` is handled
 //! here: unpacking layers, `COPY` / `ADD`, metadata, overlay2 layer cache, and
 //! export. `RUN` is delegated to a [`Backend`] you provide. Every create, read,
-//! and delete of files goes through [`FileSystem`] (a supertrait of
-//! [`ImageStore`]); the default is [`LocalImageStore`] / [`LocalFs`].
+//! and delete of files goes through [`FileSystem`]; the default is [`LocalFs`]
+//! via [`ImageStore::default`].
 //!
 //! # Quick start
 //!
@@ -50,13 +50,13 @@
 //!
 //! A non-zero [`RunResult::status`] fails the build.
 //!
-//! # Image store
+//! # Filesystem
 //!
-//! [`ImageStore`] extends [`FileSystem`]: overlay2 cache, stage rootfs, `COPY`,
-//! unpack, and export all call those methods instead of `std::fs`.
-//! [`Buildkit::new`] uses [`LocalImageStore::default`]. Pass another directory
-//! with [`LocalImageStore::new`], or implement [`FileSystem`] + [`ImageStore`]
-//! and construct with [`Buildkit::with_image_store`].
+//! Overlay2 cache, stage rootfs, `COPY`, unpack, export, and image blobs all
+//! call [`FileSystem`] instead of `std::fs`. [`Buildkit::new`] uses
+//! [`ImageStore::default`] (host [`LocalFs`] under Docker's data-root). Pass
+//! another directory with [`ImageStore::new`], or implement [`FileSystem`] and
+//! construct with [`Buildkit::with_fs`].
 //!
 //! # Pulling without a Dockerfile
 //!
@@ -160,8 +160,8 @@ use crate::progress::PullEvent as ProgressEvent;
 ///
 /// Does not unpack layers. Pass `force_pull` to consult the registry even when
 /// a local copy exists. See [`ensure_rootfs`] to also materialize a rootfs.
-pub async fn ensure_image<S: ImageStore>(
-    store: &S,
+pub async fn ensure_image<F: FileSystem>(
+    store: &ImageStore<F>,
     image: &str,
     platform: &Platform,
     force_pull: bool,
@@ -170,8 +170,8 @@ pub async fn ensure_image<S: ImageStore>(
 }
 
 /// [`ensure_image`] that reports download progress to `progress`.
-pub async fn ensure_image_with_progress<S: ImageStore>(
-    store: &S,
+pub async fn ensure_image_with_progress<F: FileSystem>(
+    store: &ImageStore<F>,
     image: &str,
     platform: &Platform,
     force_pull: bool,
@@ -189,8 +189,8 @@ pub async fn ensure_image_with_progress<S: ImageStore>(
 ///
 /// Reuses a previous unpack of the same content when the fingerprint still
 /// matches. `force_pull` always re-fetches from the registry first.
-pub async fn ensure_rootfs<S: ImageStore>(
-    store: &S,
+pub async fn ensure_rootfs<F: FileSystem>(
+    store: &ImageStore<F>,
     image: &str,
     dest: &std::path::Path,
     platform: &Platform,
@@ -212,8 +212,8 @@ pub async fn ensure_rootfs<S: ImageStore>(
 ///
 /// When `announce_missing` is true and the image is not cached, emits
 /// [`PullEvent::UnableToFindLocally`] before pulling.
-pub async fn ensure_rootfs_with_progress<S: ImageStore>(
-    store: &S,
+pub async fn ensure_rootfs_with_progress<F: FileSystem>(
+    store: &ImageStore<F>,
     image: &str,
     dest: &std::path::Path,
     platform: &Platform,

@@ -12,7 +12,7 @@ use crate::cache::{self, LayerCache};
 use crate::context::{copy_into, BuildContext};
 use crate::expand;
 use crate::export::{self, ImageMeta};
-use crate::fs::copy_tree;
+use crate::fs::{copy_tree, FileSystem};
 use crate::fsutil::{guest_to_host, join_workdir};
 use crate::materialize::materialize_rootfs;
 use crate::platform::default_pull_platform;
@@ -38,8 +38,8 @@ struct StageState {
     layer_id: String,
 }
 
-pub async fn build<B: Backend, S: ImageStore>(
-    kit: &Buildkit<B, S>,
+pub async fn build<B: Backend, F: FileSystem>(
+    kit: &Buildkit<B, F>,
     request: BuildRequest,
     progress: &mut dyn BuildProgress,
 ) -> Result<BuildResult, Error> {
@@ -341,8 +341,8 @@ pub async fn build<B: Backend, S: ImageStore>(
     Ok(BuildResult { tags, image_ids })
 }
 
-fn export_final<S: ImageStore>(
-    store: &S,
+fn export_final<F: FileSystem>(
+    store: &ImageStore<F>,
     cache: &LayerCache,
     final_state: &StageState,
     tags: &[String],
@@ -559,8 +559,8 @@ fn resolve_global_args(
     out
 }
 
-fn init_stage_from_image<S: ImageStore>(
-    store: &S,
+fn init_stage_from_image<F: FileSystem>(
+    store: &ImageStore<F>,
     platform: &Platform,
     base: &str,
     base_as_scratch: bool,
@@ -619,7 +619,10 @@ fn instruction_needs_writable(inst: &Instruction) -> bool {
     )
 }
 
-fn prepare_writable<S: ImageStore>(store: &S, state: &mut StageState) -> Result<(), Error> {
+fn prepare_writable<F: FileSystem>(
+    store: &ImageStore<F>,
+    state: &mut StageState,
+) -> Result<(), Error> {
     if !state.rootfs_shared {
         return Ok(());
     }
@@ -634,8 +637,8 @@ fn prepare_writable<S: ImageStore>(store: &S, state: &mut StageState) -> Result<
     Ok(())
 }
 
-async fn apply_instruction<B: Backend, S: ImageStore>(
-    kit: &Buildkit<B, S>,
+async fn apply_instruction<B: Backend, F: FileSystem>(
+    kit: &Buildkit<B, F>,
     state: &mut StageState,
     inst: &Instruction,
     context: &BuildContext,
@@ -806,8 +809,8 @@ fn command_to_args(
     }
 }
 
-fn write_heredocs<S: ImageStore>(
-    store: &S,
+fn write_heredocs<F: FileSystem>(
+    store: &ImageStore<F>,
     state: &StageState,
     heredocs: &[dockerfile::Heredoc],
     dest_guest: &str,
@@ -834,8 +837,8 @@ fn write_heredocs<S: ImageStore>(
     Ok(())
 }
 
-fn apply_copy<S: ImageStore>(
-    store: &S,
+fn apply_copy<F: FileSystem>(
+    store: &ImageStore<F>,
     state: &mut StageState,
     from: Option<&str>,
     sources: &[String],
@@ -870,8 +873,8 @@ fn apply_copy<S: ImageStore>(
     Ok(())
 }
 
-async fn apply_add<S: ImageStore>(
-    store: &S,
+async fn apply_add<F: FileSystem>(
+    store: &ImageStore<F>,
     state: &mut StageState,
     sources: &[String],
     dest_guest: &str,
@@ -924,8 +927,8 @@ fn url_filename(url: &str) -> String {
     }
 }
 
-fn url_dest_path<S: ImageStore>(
-    store: &S,
+fn url_dest_path<F: FileSystem>(
+    store: &ImageStore<F>,
     dest_host: &Path,
     as_dir: bool,
     url: &str,
@@ -941,7 +944,11 @@ fn url_dest_path<S: ImageStore>(
     }
 }
 
-async fn download_url<S: ImageStore>(store: &S, url: &str, dest: &Path) -> Result<(), Error> {
+async fn download_url<F: FileSystem>(
+    store: &ImageStore<F>,
+    url: &str,
+    dest: &Path,
+) -> Result<(), Error> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .user_agent("buildkit/0.1")
@@ -971,8 +978,8 @@ async fn download_url<S: ImageStore>(store: &S, url: &str, dest: &Path) -> Resul
     Ok(())
 }
 
-fn copy_dest_path<S: ImageStore>(
-    store: &S,
+fn copy_dest_path<F: FileSystem>(
+    store: &ImageStore<F>,
     dest_host: &Path,
     dest_is_dir: bool,
     multi_src: bool,
@@ -992,8 +999,8 @@ fn copy_dest_path<S: ImageStore>(
     }
 }
 
-async fn run_in_rootfs<B: Backend, S: ImageStore>(
-    kit: &Buildkit<B, S>,
+async fn run_in_rootfs<B: Backend, F: FileSystem>(
+    kit: &Buildkit<B, F>,
     state: &StageState,
     args: Vec<String>,
     network: NetworkMode,

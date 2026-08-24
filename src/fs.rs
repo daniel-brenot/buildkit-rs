@@ -60,10 +60,10 @@ pub struct FsDirEntry {
 
 /// How this crate creates, reads, and deletes files.
 ///
-/// [`ImageStore`](`crate::ImageStore`) extends this trait. Implement these
-/// methods to control every filesystem operation during a build (overlay2
-/// cache, stage rootfs, `COPY` / `ADD`, unpack, export). [`LocalFs`] is the
-/// default: the host `std::fs`.
+/// Implement these methods to control every filesystem operation during a
+/// build (image blobs, overlay2 cache, stage rootfs, `COPY` / `ADD`, unpack,
+/// export). [`crate::ImageStore`] uses this trait for I/O; blob layout stays
+/// fixed. [`LocalFs`] is the default: the host `std::fs`.
 pub trait FileSystem: Send + Sync {
     /// Create `path` and any missing parents.
     fn create_dir_all(&self, path: &Path) -> Result<(), Error>;
@@ -323,72 +323,72 @@ fn meta_from_std(m: std::fs::Metadata) -> FsMetadata {
     }
 }
 
-/// Forward every [`FileSystem`] method to [`LocalFs`].
-macro_rules! impl_filesystem_via_localfs {
-    ($ty:ty) => {
-        impl $crate::fs::FileSystem for $ty {
+/// Forward every [`FileSystem`] method to `self.fs`.
+macro_rules! impl_filesystem_via_fs {
+    ($ty:ident) => {
+        impl<F: $crate::fs::FileSystem> $crate::fs::FileSystem for $ty<F> {
             fn create_dir_all(&self, path: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.create_dir_all(path)
+                self.fs.create_dir_all(path)
             }
             fn remove_dir_all(&self, path: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.remove_dir_all(path)
+                self.fs.remove_dir_all(path)
             }
             fn remove_dir(&self, path: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.remove_dir(path)
+                self.fs.remove_dir(path)
             }
             fn remove_file(&self, path: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.remove_file(path)
+                self.fs.remove_file(path)
             }
             fn write(&self, path: &Path, data: &[u8]) -> Result<(), Error> {
-                $crate::fs::LocalFs.write(path, data)
+                self.fs.write(path, data)
             }
             fn read(&self, path: &Path) -> Result<Vec<u8>, Error> {
-                $crate::fs::LocalFs.read(path)
+                self.fs.read(path)
             }
             fn read_to_string(&self, path: &Path) -> Result<String, Error> {
-                $crate::fs::LocalFs.read_to_string(path)
+                self.fs.read_to_string(path)
             }
             fn copy(&self, from: &Path, to: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.copy(from, to)
+                self.fs.copy(from, to)
             }
             fn metadata(&self, path: &Path) -> Result<$crate::fs::FsMetadata, Error> {
-                $crate::fs::LocalFs.metadata(path)
+                self.fs.metadata(path)
             }
             fn symlink_metadata(&self, path: &Path) -> Result<$crate::fs::FsMetadata, Error> {
-                $crate::fs::LocalFs.symlink_metadata(path)
+                self.fs.symlink_metadata(path)
             }
             fn read_link(&self, path: &Path) -> Result<PathBuf, Error> {
-                $crate::fs::LocalFs.read_link(path)
+                self.fs.read_link(path)
             }
             fn symlink(&self, target: &Path, path: &Path) -> Result<(), Error> {
-                $crate::fs::LocalFs.symlink(target, path)
+                self.fs.symlink(target, path)
             }
             fn read_dir(&self, path: &Path) -> Result<Vec<$crate::fs::FsDirEntry>, Error> {
-                $crate::fs::LocalFs.read_dir(path)
+                self.fs.read_dir(path)
             }
             fn create_file(&self, path: &Path) -> Result<Box<dyn Write + Send>, Error> {
-                $crate::fs::LocalFs.create_file(path)
+                self.fs.create_file(path)
             }
             fn open_file(&self, path: &Path) -> Result<Box<dyn Read + Send>, Error> {
-                $crate::fs::LocalFs.open_file(path)
+                self.fs.open_file(path)
             }
             fn set_permissions(&self, path: &Path, mode: u32) -> Result<(), Error> {
-                $crate::fs::LocalFs.set_permissions(path, mode)
+                self.fs.set_permissions(path, mode)
             }
             fn canonicalize(&self, path: &Path) -> Result<PathBuf, Error> {
-                $crate::fs::LocalFs.canonicalize(path)
+                self.fs.canonicalize(path)
             }
             fn set_virtual_owner(&self, path: &Path, uid: u32, gid: u32) -> Result<(), Error> {
-                $crate::fs::LocalFs.set_virtual_owner(path, uid, gid)
+                self.fs.set_virtual_owner(path, uid, gid)
             }
             fn junction(&self, target: &Path, path: &Path) -> Result<bool, Error> {
-                $crate::fs::LocalFs.junction(target, path)
+                self.fs.junction(target, path)
             }
         }
     };
 }
 
-pub(crate) use impl_filesystem_via_localfs;
+pub(crate) use impl_filesystem_via_fs;
 
 /// Recursively copy a file or directory tree.
 pub fn copy_tree<F: FileSystem>(fs: &F, src: &Path, dest: &Path) -> Result<(), Error> {

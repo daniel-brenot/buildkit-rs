@@ -7,150 +7,9 @@ use std::path::PathBuf;
 use oci_distribution::config::ConfigFile;
 use oci_distribution::Reference;
 
-use crate::fs::{impl_filesystem_via_localfs, FileSystem};
+use crate::fs::{impl_filesystem_via_fs, FileSystem, LocalFs};
 use crate::platform::Platform;
 use crate::Error;
-
-/// Storage for pulled and exported images, and the filesystem used for every
-/// build I/O.
-///
-/// [`FileSystem`] methods are how this crate creates, reads, and deletes
-/// files: overlay2 cache, stage rootfs, `COPY` / `ADD`, unpack, and export.
-/// Image configs and layer blobs use the methods below (defaults write Docker's
-/// data-root layout under [`Self::root`]).
-///
-/// [`LocalImageStore`] is the default. Implement [`FileSystem`] plus
-/// [`Self::root`] to redirect every file operation.
-pub trait ImageStore: FileSystem {
-    /// Host directory for overlay2 instruction cache and temporary build work.
-    fn root(&self) -> &Path;
-
-    /// Whether config and layers for this reference and platform are present.
-    fn is_cached(&self, reference: &Reference, platform: &Platform) -> bool;
-
-    /// Manifest digest (pull) or layer digest (export), if stored.
-    fn image_digest(&self, reference: &Reference, platform: &Platform) -> Option<String>;
-
-    /// Image config for this reference and platform.
-    fn image_config(&self, reference: &Reference, platform: &Platform)
-        -> Result<ConfigFile, Error>;
-
-    /// Layer digests in manifest order, when the store recorded them.
-    fn layer_digests(&self, reference: &Reference, platform: &Platform) -> Vec<String>;
-
-    /// Number of stored layer blobs.
-    fn layer_count(&self, reference: &Reference, platform: &Platform) -> usize;
-
-    /// Whether layer blob `index` (0-based) exists.
-    fn has_layer(&self, reference: &Reference, platform: &Platform, index: usize) -> bool;
-
-    /// Read layer blob `index` (0-based, manifest order).
-    fn read_layer(
-        &self,
-        reference: &Reference,
-        platform: &Platform,
-        index: usize,
-    ) -> Result<Vec<u8>, Error>;
-
-    /// Size in bytes of layer blob `index` (0 if missing).
-    fn layer_size(&self, reference: &Reference, platform: &Platform, index: usize) -> u64;
-
-    /// Persist a pulled or exported image, replacing any previous copy.
-    fn put_image(
-        &self,
-        reference: &Reference,
-        platform: &Platform,
-        image: StoredImage,
-    ) -> Result<(), Error>;
-
-    /// Persist a single-layer image by copying `layer_path` (avoids loading
-    /// large blobs into memory). The default reads the file and calls
-    /// [`Self::put_image`].
-    fn put_image_layer_file(
-        &self,
-        reference: &Reference,
-        platform: &Platform,
-        digest: &str,
-        config: &ConfigFile,
-        layer_path: &Path,
-    ) -> Result<(), Error> {
-        let data = self.read(layer_path)?;
-        self.put_image(
-            reference,
-            platform,
-            StoredImage {
-                digest: Some(digest.to_string()),
-                config: config.clone(),
-                layers: vec![StoredLayer {
-                    digest: Some(digest.to_string()),
-                    data,
-                }],
-            },
-        )
-    }
-
-    /// Whether the stored digest and layer blobs match `digest` / `layer_digests`.
-    fn layers_match(
-        &self,
-        reference: &Reference,
-        platform: &Platform,
-        digest: &str,
-        layer_digests: &[String],
-    ) -> bool {
-        if digest.is_empty() {
-            return false;
-        }
-        let Some(local) = self.image_digest(reference, platform) else {
-            return false;
-        };
-        if local.trim() != digest.trim() || !self.is_cached(reference, platform) {
-            return false;
-        }
-        let stored = self.layer_digests(reference, platform);
-        if stored.len() != layer_digests.len() {
-            return false;
-        }
-        stored
-            .iter()
-            .zip(layer_digests)
-            .enumerate()
-            .all(|(i, (got, expected))| got == expected && self.has_layer(reference, platform, i))
-    }
-
-    /// Whether this tagged image already stores `digest` and at least one layer.
-    fn has_digest(&self, reference: &Reference, platform: &Platform, digest: &str) -> bool {
-        self.image_digest(reference, platform)
-            .as_deref()
-            .map(str::trim)
-            == Some(digest.trim())
-            && self.has_layer(reference, platform, 0)
-    }
-
-    /// Fingerprint of stored content, used to reuse a materialized rootfs.
-    fn content_stamp(&self, reference: &Reference, platform: &Platform) -> Result<String, Error> {
-        if let Some(digest) = self.image_digest(reference, platform) {
-            let layers = self.layer_digests(reference, platform);
-            if !layers.is_empty() {
-                return Ok(format!("{digest}\n{}\n", layers.join("\n")));
-            }
-            return Ok(format!("{digest}\n"));
-        }
-
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let config = self.image_config(reference, platform)?;
-        let config_data = serde_json::to_string(&config)?;
-        let mut hasher = DefaultHasher::new();
-        config_data.hash(&mut hasher);
-        let n = self.layer_count(reference, platform);
-        for i in 0..n {
-            i.hash(&mut hasher);
-            self.layer_size(reference, platform, i).hash(&mut hasher);
-        }
-        Ok(format!("{:016x}", hasher.finish()))
-    }
-}
 
 /// An image to persist: config plus ordered layer blobs.
 #[derive(Debug, Clone)]
@@ -172,7 +31,11 @@ pub struct StoredLayer {
     pub data: Vec<u8>,
 }
 
-/// overlay2 cache, work dirs, and image blobs through [`FileSystem`].
+/// Pulled and exported image blobs, written through a [`FileSystem`].
+///
+/// Blob layout is fixed. Swap [`FileSystem`] to control how those files are
+/// created, read, and deleted. Overlay2 cache and scratch work also live under
+/// [`Self::root`].
 ///
 /// ```text
 /// <root>/
@@ -184,14 +47,20 @@ pub struct StoredLayer {
 ///   work/      # temporary build directories
 /// ```
 #[derive(Debug, Clone)]
-pub struct LocalImageStore {
+pub struct ImageStore<F = LocalFs> {
+    fs: F,
     root: PathBuf,
 }
 
-impl LocalImageStore {
-    /// Use `root` as the data directory. The path is not created until a write.
+/// [`ImageStore`] on the host filesystem ([`LocalFs`]).
+pub type LocalImageStore = ImageStore<LocalFs>;
+
+impl ImageStore<LocalFs> {
+    /// Use `root` as the data directory on the host filesystem.
+    ///
+    /// The path is not created until a write.
     pub fn new(root: PathBuf) -> Self {
-        LocalImageStore { root }
+        Self::with_fs(LocalFs, root)
     }
 
     /// Docker's data-root on this host (parent of `overlay2/`).
@@ -206,6 +75,29 @@ impl LocalImageStore {
     ///   distro is present, else `%ProgramData%\Docker`
     pub fn default_root() -> PathBuf {
         docker_data_root()
+    }
+}
+
+impl Default for ImageStore<LocalFs> {
+    fn default() -> Self {
+        Self::new(Self::default_root())
+    }
+}
+
+impl<F: FileSystem> ImageStore<F> {
+    /// Use `fs` for every file operation under `root`.
+    pub fn with_fs(fs: F, root: PathBuf) -> Self {
+        ImageStore { fs, root }
+    }
+
+    /// Filesystem this store writes through.
+    pub fn fs(&self) -> &F {
+        &self.fs
+    }
+
+    /// Host directory for overlay2 instruction cache and temporary build work.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Directory that stores config, digest, and layer blobs for this image.
@@ -228,33 +120,22 @@ impl LocalImageStore {
         self.layers_dir(reference, platform)
             .join(format!("{index}.tar.gz"))
     }
-}
 
-impl Default for LocalImageStore {
-    fn default() -> Self {
-        Self::new(Self::default_root())
-    }
-}
-
-impl_filesystem_via_localfs!(LocalImageStore);
-
-impl ImageStore for LocalImageStore {
-    fn root(&self) -> &Path {
-        &self.root
-    }
-
-    fn is_cached(&self, reference: &Reference, platform: &Platform) -> bool {
+    /// Whether config and layers for this reference and platform are present.
+    pub fn is_cached(&self, reference: &Reference, platform: &Platform) -> bool {
         self.is_file(&self.image_dir(reference, platform).join("config.json"))
     }
 
-    fn image_digest(&self, reference: &Reference, platform: &Platform) -> Option<String> {
+    /// Manifest digest (pull) or layer digest (export), if stored.
+    pub fn image_digest(&self, reference: &Reference, platform: &Platform) -> Option<String> {
         self.read_to_string(&self.image_dir(reference, platform).join("digest"))
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
     }
 
-    fn image_config(
+    /// Image config for this reference and platform.
+    pub fn image_config(
         &self,
         reference: &Reference,
         platform: &Platform,
@@ -264,7 +145,8 @@ impl ImageStore for LocalImageStore {
         serde_json::from_str(&data).map_err(|e| Error::other(format!("cached image config: {e}")))
     }
 
-    fn layer_digests(&self, reference: &Reference, platform: &Platform) -> Vec<String> {
+    /// Layer digests in manifest order, when the store recorded them.
+    pub fn layer_digests(&self, reference: &Reference, platform: &Platform) -> Vec<String> {
         let path = self.layers_dir(reference, platform).join("digests");
         let Ok(text) = self.read_to_string(&path) else {
             return Vec::new();
@@ -276,7 +158,8 @@ impl ImageStore for LocalImageStore {
             .collect()
     }
 
-    fn layer_count(&self, reference: &Reference, platform: &Platform) -> usize {
+    /// Number of stored layer blobs.
+    pub fn layer_count(&self, reference: &Reference, platform: &Platform) -> usize {
         let dir = self.layers_dir(reference, platform);
         let Ok(entries) = self.read_dir(&dir) else {
             return 0;
@@ -287,11 +170,13 @@ impl ImageStore for LocalImageStore {
             .count()
     }
 
-    fn has_layer(&self, reference: &Reference, platform: &Platform, index: usize) -> bool {
+    /// Whether layer blob `index` (0-based) exists.
+    pub fn has_layer(&self, reference: &Reference, platform: &Platform, index: usize) -> bool {
         self.is_file(&self.layer_path(reference, platform, index))
     }
 
-    fn read_layer(
+    /// Read layer blob `index` (0-based, manifest order).
+    pub fn read_layer(
         &self,
         reference: &Reference,
         platform: &Platform,
@@ -300,13 +185,15 @@ impl ImageStore for LocalImageStore {
         self.read(&self.layer_path(reference, platform, index))
     }
 
-    fn layer_size(&self, reference: &Reference, platform: &Platform, index: usize) -> u64 {
+    /// Size in bytes of layer blob `index` (0 if missing).
+    pub fn layer_size(&self, reference: &Reference, platform: &Platform, index: usize) -> u64 {
         self.metadata(&self.layer_path(reference, platform, index))
             .map(|m| m.len())
             .unwrap_or(0)
     }
 
-    fn put_image(
+    /// Persist a pulled or exported image, replacing any previous copy.
+    pub fn put_image(
         &self,
         reference: &Reference,
         platform: &Platform,
@@ -347,7 +234,9 @@ impl ImageStore for LocalImageStore {
         Ok(())
     }
 
-    fn put_image_layer_file(
+    /// Persist a single-layer image by copying `layer_path` (avoids loading
+    /// large blobs into memory).
+    pub fn put_image_layer_file(
         &self,
         reference: &Reference,
         platform: &Platform,
@@ -377,7 +266,75 @@ impl ImageStore for LocalImageStore {
         self.write(&dir.join("digest"), digest.as_bytes())?;
         Ok(())
     }
+
+    /// Whether the stored digest and layer blobs match `digest` / `layer_digests`.
+    pub fn layers_match(
+        &self,
+        reference: &Reference,
+        platform: &Platform,
+        digest: &str,
+        layer_digests: &[String],
+    ) -> bool {
+        if digest.is_empty() {
+            return false;
+        }
+        let Some(local) = self.image_digest(reference, platform) else {
+            return false;
+        };
+        if local.trim() != digest.trim() || !self.is_cached(reference, platform) {
+            return false;
+        }
+        let stored = self.layer_digests(reference, platform);
+        if stored.len() != layer_digests.len() {
+            return false;
+        }
+        stored
+            .iter()
+            .zip(layer_digests)
+            .enumerate()
+            .all(|(i, (got, expected))| got == expected && self.has_layer(reference, platform, i))
+    }
+
+    /// Whether this tagged image already stores `digest` and at least one layer.
+    pub fn has_digest(&self, reference: &Reference, platform: &Platform, digest: &str) -> bool {
+        self.image_digest(reference, platform)
+            .as_deref()
+            .map(str::trim)
+            == Some(digest.trim())
+            && self.has_layer(reference, platform, 0)
+    }
+
+    /// Fingerprint of stored content, used to reuse a materialized rootfs.
+    pub fn content_stamp(
+        &self,
+        reference: &Reference,
+        platform: &Platform,
+    ) -> Result<String, Error> {
+        if let Some(digest) = self.image_digest(reference, platform) {
+            let layers = self.layer_digests(reference, platform);
+            if !layers.is_empty() {
+                return Ok(format!("{digest}\n{}\n", layers.join("\n")));
+            }
+            return Ok(format!("{digest}\n"));
+        }
+
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let config = self.image_config(reference, platform)?;
+        let config_data = serde_json::to_string(&config)?;
+        let mut hasher = DefaultHasher::new();
+        config_data.hash(&mut hasher);
+        let n = self.layer_count(reference, platform);
+        for i in 0..n {
+            i.hash(&mut hasher);
+            self.layer_size(reference, platform, i).hash(&mut hasher);
+        }
+        Ok(format!("{:016x}", hasher.finish()))
+    }
 }
+
+impl_filesystem_via_fs!(ImageStore);
 
 fn sanitize(reference: &Reference, platform: &Platform) -> String {
     let base = reference
@@ -458,7 +415,7 @@ mod tests {
 
     #[test]
     fn default_root_is_docker_data_dir() {
-        let root = LocalImageStore::default_root();
+        let root = ImageStore::default_root();
         assert!(root.is_absolute() || root.to_string_lossy().starts_with(r"\\"));
         let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("");
         assert!(
