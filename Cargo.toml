@@ -9,7 +9,6 @@ keywords = ["docker", "dockerfile", "buildkit", "oci", "containers"]
 categories = ["development-tools"]
 
 [dependencies]
-dockerfile = { git = "https://github.com/daniel-brenot/dockerfile-rs.git", version = "0.1.0" }
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 flate2 = "1"
@@ -22,6 +21,7 @@ serde_json = "1"
 tracing = "0.1"
 sha2 = "0.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+containerfile = "0.1.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -108,8 +108,8 @@ name = "buildkit"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "containerfile",
  "directories",
- "dockerfile",
  "flate2",
  "futures-util",
  "libc",
@@ -209,6 +209,16 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "containerfile"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee19d603dd4aa95cd9b72f19131469345ecd99b1529d6ea68760546ccef44f16"
+dependencies = [
+ "thiserror 2.0.20",
+ "winnow",
+]
 
 [[package]]
 name = "core-foundation"
@@ -324,15 +334,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
-]
-
-[[package]]
-name = "dockerfile"
-version = "0.1.0"
-source = "git+https://github.com/daniel-brenot/dockerfile-rs.git#b97c5f1a6e3dddda11236d1aa1f7ef11797340f2"
-dependencies = [
- "thiserror 2.0.20",
- "winnow",
 ]
 
 [[package]]
